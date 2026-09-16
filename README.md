@@ -115,6 +115,14 @@ sequenceDiagram
 | Redis down | Correct, just slower, the cache is never the source of truth                     | *Phase 5* |
 | Connection pool exhausted | Reproduced deliberately, measured, then fixed                                    | *Phase 8* |
 
+## Consistency model
+
+Within `payment-service`, a payment and its idempotency key and its outbox event are **strongly
+consistent** - one PostgreSQL transaction. Across services the model is **eventual consistency**: for
+a short window a payment can be `CAPTURED` while the ledger has not posted yet. That is a design
+choice, not a defect, and the API is honest about it; the ledger endpoint can legitimately return
+"not posted yet". The alternative, a distributed transaction across both services, trades a
+significant amount of availability for a guarantee this domain does not need.
 
 ## Roadmap and honest status
 
