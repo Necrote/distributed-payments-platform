@@ -1,0 +1,116 @@
+# payment-service - local/dev configuration.
+# Nothing secret lives in this file. Every credential is an environment variable with a
+# development-only default, so `docker compose up` works out of the box and production overrides
+# the same keys. Phase 7 replaces these with a Kubernetes Secret.
+
+spring:
+  application:
+    name: payment-service
+
+  datasource:
+    url: ${PAYMENTS_DB_URL:jdbc:postgresql://localhost:5432/payments}
+    username: ${PAYMENTS_DB_USER:payments}
+    password: ${PAYMENTS_DB_PASSWORD:payments}
+    hikari:
+      # Deliberately small. The HikariCP experiment in Phase 8 starts by making this the
+      # bottleneck on purpose, so leave it here and change it with evidence, not by feel.
+      # Rule of thumb worth being able to defend: pool size is bounded by what the DATABASE can
+      # serve concurrently, not by how many threads the app has.
+      maximum-pool-size: ${PAYMENTS_DB_POOL_MAX:10}
+      minimum-idle: 2
+      connection-timeout: 3000      # ms to wait for a connection before failing fast
+      max-lifetime: 900000          # 15 min, shorter than any proxy/DB idle timeout
+      pool-name: payments-pool
+
+  jpa:
+    open-in-view: false             # off: no lazy loading inside the view layer, no hidden queries
+    hibernate:
+      ddl-auto: validate            # Flyway owns the schema; Hibernate only checks it matches
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        # Uncomment while tuning queries in Phase 8 - noisy, so not on by default.
+        # generate_statistics: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false      # this database has no pre-Flyway history; fail loudly if it does
+
+  threads:
+    virtual:
+      # Java 21 virtual threads for the servlet container. Turn this ON deliberately in Phase 8 and
+      # measure it - virtual threads help with blocking I/O, but they do NOT create database
+      # capacity, and pinning on synchronized blocks is real. Measure, then decide.
+      enabled: false
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful                # finish in-flight payments before the pod dies
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,flyway
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true               # /actuator/health/liveness and /readiness for Kubernetes
+  metrics:
+    tags:
+      application: payment-service
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+# ---------------------------------------------------------------------------------------------
+# Phase 3: the processor simulator. Timeouts belong in configuration, never hard-coded.
+# ---------------------------------------------------------------------------------------------
+payments:
+  processor:
+    base-url: ${PROCESSOR_BASE_URL:http://localhost:8081}
+    connect-timeout: 500ms
+    read-timeout: 2s                # must be < the client-facing SLO, or the caller times out first
+  idempotency:
+    key-ttl: 24h                    # how long a replayed key returns the original response
+
+# Phase 3 (Day 15-17). Left commented so the first commit does not claim resilience it has not
+# demonstrated; the guide switches these on one at a time, each with a failure scenario.
+# resilience4j:
+#   timelimiter:
+#     instances:
+#       processor:
+#         timeoutDuration: 2s
+#   retry:
+#     instances:
+#       processor:
+#         maxAttempts: 3
+#         waitDuration: 200ms
+#         enableExponentialBackoff: true
+#         exponentialBackoffMultiplier: 2
+#         enableRandomizedWait: true      # jitter: without it, retries synchronise into a storm
+#         randomizedWaitFactor: 0.5
+#         retryExceptions:
+#           - java.io.IOException
+#           - java.util.concurrent.TimeoutException
+#   circuitbreaker:
+#     instances:
+#       processor:
+#         slidingWindowType: COUNT_BASED
+#         slidingWindowSize: 20
+#         failureRateThreshold: 50
+#         waitDurationInOpenState: 10s
+#         permittedNumberOfCallsInHalfOpenState: 3
+#   bulkhead:
+#     instances:
+#       processor:
+#         maxConcurrentCalls: 20          # one slow dependency must not eat every request thread
+
+logging:
+  level:
+    com.vivekpatel.payments: INFO
+    org.hibernate.SQL: WARN
