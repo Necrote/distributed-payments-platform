@@ -1,0 +1,104 @@
+# Local development stack.
+#
+# Phase 1-3 need PostgreSQL only:      docker compose up -d
+# Phase 4 adds Kafka:                  docker compose --profile phase4 up -d
+# Phase 5 adds Redis:                  docker compose --profile phase5 up -d
+# Everything at once:                  docker compose --profile phase4 --profile phase5 up -d
+#
+# Kafka and Redis are defined here from the first commit but sit behind profiles, so they exist as
+# a decision you can read rather than a surprise later - and so `docker compose up` in week one
+# starts one container instead of three you are not using yet. Nothing here is production
+# configuration: single broker, no replication, no auth, no persistence guarantees.
+
+name: distributed-payments-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dpp-postgres
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Depend on this, not on "the container started". A container that is up is not a database
+      # that is ready, and the difference is a flaky test suite.
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    command:
+      # Phase 8: turn these on to see the slow queries behind a p95 spike instead of guessing.
+      # - "postgres"
+      # - "-c"
+      # - "log_min_duration_statement=200"
+      - "postgres"
+      - "-c"
+      - "max_connections=100"
+
+  # ------------------------------------------------------------------------------------------
+  # ENABLE IN PHASE 4 (Week 4, Day 19):  docker compose --profile phase4 up -d
+  #
+  # Single-broker Kafka in KRaft mode - no ZooKeeper. One broker is the honest choice for a laptop:
+  # it demonstrates partitions, consumer groups, offsets and lag, and it demonstrably does NOT
+  # demonstrate replication or leader election. Say that in the README rather than implying a
+  # cluster. Note the two listeners: `kafka:9092` for containers on this network, and
+  # `localhost:29092` for the services and tests you run from your IDE.
+  # ------------------------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: dpp-kafka
+    profiles: ["phase4"]
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # One broker means one replica. Leave these at 1 and be explicit about the limitation.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Three partitions per topic: enough to make partition keys and ordering observable, few
+      # enough to reason about. Ordering is guaranteed within a partition only - which is exactly
+      # why the outbox uses paymentId as the key.
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------------------------------------------------------
+  # ENABLE IN PHASE 5 (Week 6, Day 31):  docker compose --profile phase5 up -d
+  #
+  # Redis is a cache and an idempotency accelerator. It is never the system of record: PostgreSQL
+  # is. The Phase 5 acceptance test is literally `docker compose stop redis` - payments must stay
+  # correct and get slower, not stop or start double-charging.
+  # ------------------------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: dpp-redis
+    profiles: ["phase5"]
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:

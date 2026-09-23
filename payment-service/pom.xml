@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!-- Spring Boot's parent supplies dependency management and sensible plugin defaults.
+       There is deliberately no aggregator POM at the repository root: each service builds and
+       versions independently, which is what would happen if these were three repositories, and it
+       keeps CI able to build one service without building all three. -->
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.5</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.vivekpatel</groupId>
+  <artifactId>payment-service</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <name>payment-service</name>
+  <description>API-facing payment service: lifecycle, idempotency, outbox</description>
+
+  <properties>
+    <java.version>21</java.version>
+    <!-- Overriding the parent's managed Flyway version in one place keeps flyway-core and
+         flyway-database-postgresql on the same version. Flyway 10 split PostgreSQL support into
+         its own artifact; forgetting the second dependency is the classic "no database found to
+         handle jdbc:postgresql" startup failure. -->
+    <flyway.version>10.17.3</flyway.version>
+    <springdoc.version>2.6.0</springdoc.version>
+    <resilience4j.version>2.2.0</resilience4j.version>
+    <pitest.version>1.16.1</pitest.version>
+    <pitest.junit5.version>1.2.1</pitest.junit5.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <!-- OpenAPI 3 document + Swagger UI at /swagger-ui.html, generated from the controllers. -->
+    <dependency>
+      <groupId>org.springdoc</groupId>
+      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+      <version>${springdoc.version}</version>
+    </dependency>
+
+    <!-- Phase 3. Present from the first commit so the dependency is a decision, not an accident. -->
+    <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-spring-boot3</artifactId>
+      <version>${resilience4j.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-database-postgresql</artifactId>
+      <version>${flyway.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
+    <!-- No Lombok anywhere in this repository. Java 21 records cover the DTO/event cases, and
+         @Data on a JPA entity generates equals/hashCode over mutable fields, which is a real bug
+         in a system that puts entities in collections. -->
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+
+      <!-- Integration tests are named *IT and run by failsafe during `mvn verify`, so a developer
+           without Docker running still gets a fast `mvn test` loop. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Mutation testing. Run it manually first:
+             mvn org.pitest:pitest-maven:mutationCoverage
+           Read the survived mutants, strengthen the tests, and only then uncomment
+           <mutationThreshold> so the build fails below the number you have actually reached.
+           Setting a threshold you have never measured is how a "quality gate" becomes decoration. -->
+      <plugin>
+        <groupId>org.pitest</groupId>
+        <artifactId>pitest-maven</artifactId>
+        <version>${pitest.version}</version>
+        <dependencies>
+          <dependency>
+            <groupId>org.pitest</groupId>
+            <artifactId>pitest-junit5-plugin</artifactId>
+            <version>${pitest.junit5.version}</version>
+          </dependency>
+        </dependencies>
+        <configuration>
+          <targetClasses>
+            <param>com.vivekpatel.payments.domain.*</param>
+            <param>com.vivekpatel.payments.service.*</param>
+          </targetClasses>
+          <targetTests>
+            <param>com.vivekpatel.payments.*Test</param>
+          </targetTests>
+          <!-- DEFAULTS plus the mutators that matter for a state machine and for boundary
+               conditions on money. -->
+          <mutators>
+            <mutator>DEFAULTS</mutator>
+            <mutator>REMOVE_CONDITIONALS</mutator>
+          </mutators>
+          <timestampedReports>false</timestampedReports>
+          <!-- <mutationThreshold>80</mutationThreshold> -->
+          <!-- <failWhenNoMutations>true</failWhenNoMutations> -->
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

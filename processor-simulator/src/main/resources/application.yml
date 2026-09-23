@@ -1,0 +1,51 @@
+# processor-simulator - a deliberately unreliable external dependency.
+#
+# Every value here is a knob you will turn during Phase 3 and Phase 8. Change them with a scenario
+# in mind and write the scenario down in docs/incidents/ - a knob turned without a hypothesis is
+# just noise.
+
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: processor-simulator
+
+simulator:
+  # NORMAL | SLOW | TIMEOUT | HTTP_500 | HTTP_429 | INTERMITTENT | DUPLICATE_RESPONSE | OUTAGE
+  # Change at runtime:  curl -X PUT 'localhost:8081/control/mode?mode=HTTP_500'
+  mode: NORMAL
+
+  # NORMAL mode: a plausible processor round trip.
+  base-latency: 120ms
+
+  # SLOW mode. Set this just BELOW the caller's read timeout to reproduce the nastiest case (slow
+  # but successful, so nothing errors and nothing alerts), or just ABOVE it to reproduce timeouts.
+  slow-latency: 10s
+
+  # TIMEOUT mode: longer than any client should ever wait.
+  timeout-latency: 60s
+
+  # INTERMITTENT mode: fraction of calls that fail, 0.0-1.0. Start at 0.3 to open a circuit
+  # breaker quickly; drop to 0.05 to see whether your thresholds tolerate a realistic background
+  # error rate without flapping.
+  intermittent-failure-rate: 0.3
+
+  # OUTAGE mode: how long connections are refused before the processor recovers by itself. Keep it
+  # longer than the breaker's waitDurationInOpenState so you can watch OPEN -> HALF_OPEN -> OPEN.
+  outage-duration: 30s
+
+  # Even in NORMAL mode, some authorisations are declined. A declined payment is a business outcome
+  # (FAILED), not a technical failure - do not retry it and do not count it in the breaker's error
+  # rate. Conflating the two is a very common design mistake and a good interview question.
+  decline-rate: 0.05
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+
+logging:
+  level:
+    com.vivekpatel.simulator: INFO

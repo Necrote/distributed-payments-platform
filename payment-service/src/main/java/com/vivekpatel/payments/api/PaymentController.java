@@ -1,0 +1,121 @@
+package com.vivekpatel.payments.api;
+
+import com.vivekpatel.payments.api.dto.CreatePaymentRequest;
+import com.vivekpatel.payments.api.dto.PaymentResponse;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.validation.Valid;
+import java.util.UUID;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * The public API surface, exactly as specified in the project brief. Every method returns
+ * {@code 501 Not Implemented} today; the guide fills them in one at a time.
+ *
+ * <p><b>Why the endpoints exist before the logic:</b> the shape of the API is a design decision and
+ * belongs in the first commit, where a reviewer can argue with it. Writing the controller last is
+ * how you end up with an API that is a mirror of your database schema.
+ *
+ * <p>Keep the controller thin. It validates input, delegates to the application service, and maps
+ * the result to HTTP. All state-machine and idempotency logic lives below this layer - if a
+ * business rule ever appears in this file, it cannot be unit-tested without a servlet container and
+ * it will not survive mutation testing.
+ */
+@RestController
+@RequestMapping("/payments")
+@Tag(name = "Payments", description = "Create, inspect, capture and refund payments")
+public class PaymentController {
+
+    // TODO Phase 1 (Day 3): constructor-inject PaymentApplicationService here. Constructor
+    // injection, not @Autowired on a field: it makes the dependency visible in the test.
+
+    /**
+     * Create a payment. The {@code Idempotency-Key} header is accepted from day one but is only
+     * enforced in Phase 2 - see ADR-004.
+     *
+     * <p>Target behaviour once implemented:
+     *
+     * <ul>
+     *   <li>{@code 201 Created} with a {@code Location} header for a new payment;</li>
+     *   <li>{@code 200 OK} with the original body when the same key and the same payload arrive
+     *       again;</li>
+     *   <li>{@code 422 Unprocessable Entity} when the same key arrives with a different payload.</li>
+     * </ul>
+     */
+    @PostMapping
+    @Operation(summary = "Create a payment (idempotent from Phase 2)")
+    public ResponseEntity<PaymentResponse> createPayment(
+            @Parameter(description = "Client-generated key that makes this call safe to retry")
+                    @RequestHeader(value = "Idempotency-Key", required = false)
+                    String idempotencyKey,
+            @Valid @RequestBody CreatePaymentRequest request) {
+        // TODO Phase 1 (Day 3): persist a CREATED payment and return 201 + Location.
+        // TODO Phase 2 (Day 7): claim the idempotency key inside the same transaction.
+        return notImplemented();
+    }
+
+    /** Fetch a payment by id. Phase 5 puts a Redis read-through cache in front of this path. */
+    @GetMapping("/{paymentId}")
+    @Operation(summary = "Fetch a payment by id")
+    public ResponseEntity<PaymentResponse> getPayment(@PathVariable UUID paymentId) {
+        // TODO Phase 1 (Day 4): 200 with the payment, or 404 as a ProblemDetail.
+        return notImplemented();
+    }
+
+    /**
+     * Capture an authorised payment. This is the endpoint the duplicate-capture concurrency test
+     * hammers on Day 10, so it must be safe under two simultaneous callers.
+     */
+    @PostMapping("/{paymentId}/capture")
+    @Operation(summary = "Capture an authorised payment")
+    public ResponseEntity<PaymentResponse> capturePayment(
+            @PathVariable UUID paymentId,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
+        // TODO Phase 1 (Day 5): AUTHORIZED -> CAPTURED through the state machine.
+        // TODO Phase 2 (Day 10): optimistic locking must make the second concurrent call lose.
+        return notImplemented();
+    }
+
+    /** Refund a captured payment. Partial refunds are out of scope - say so in the README. */
+    @PostMapping("/{paymentId}/refund")
+    @Operation(summary = "Refund a captured payment (full refunds only)")
+    public ResponseEntity<PaymentResponse> refundPayment(
+            @PathVariable UUID paymentId,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
+        // TODO Phase 1 (Day 5): CAPTURED -> REFUND_PENDING; the processor call arrives in Phase 3.
+        return notImplemented();
+    }
+
+    /**
+     * The ledger entries for a payment. Until Phase 4 there is no ledger service; this endpoint
+     * exists so the API contract is visible from the first commit.
+     */
+    @GetMapping("/{paymentId}/ledger")
+    @Operation(summary = "Double-entry ledger lines for a payment (Phase 4)")
+    public ResponseEntity<Object> getLedger(@PathVariable UUID paymentId) {
+        // TODO Phase 4 (Day 30): proxy or query the ledger service.
+        return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).body(problem());
+    }
+
+    private static ResponseEntity<PaymentResponse> notImplemented() {
+        return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
+    }
+
+    private static ProblemDetail problem() {
+        ProblemDetail detail =
+                ProblemDetail.forStatusAndDetail(
+                        HttpStatus.NOT_IMPLEMENTED, "Not implemented yet - see the build guide.");
+        detail.setTitle("Not Implemented");
+        return detail;
+    }
+}

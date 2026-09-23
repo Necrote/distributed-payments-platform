@@ -1,0 +1,33 @@
+# ledger-service - Phase 4. Present so the module boots and reports health from the day it appears.
+spring:
+  application:
+    name: ledger-service
+  datasource:
+    url: ${LEDGER_DB_URL:jdbc:postgresql://localhost:5432/payments}
+    username: ${LEDGER_DB_USER:payments}
+    password: ${LEDGER_DB_PASSWORD:payments}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    # TODO Phase 4 (Day 25): this service owns ledger_entries and processed_events. Create its own
+    # migrations here and remove those tables from payment-service's V1 with a V2 migration.
+    enabled: false
+
+  # TODO Phase 4 (Day 26): Kafka consumer configuration.
+  # kafka:
+  #   bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:29092}
+  #   consumer:
+  #     group-id: ledger
+  #     auto-offset-reset: earliest
+  #     enable-auto-commit: false   # the container commits after the listener returns, not before
+
+server:
+  port: ${SERVER_PORT:8082}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
