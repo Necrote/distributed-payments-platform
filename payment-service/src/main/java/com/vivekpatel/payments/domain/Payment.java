@@ -9,6 +9,8 @@ import jakarta.persistence.Table;
 import jakarta.persistence.Version;
 import java.time.Instant;
 import java.util.UUID;
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
 
 /**
  * The aggregate root. One row in {@code payments}, one payment lifecycle.
@@ -53,6 +55,14 @@ public class Payment {
     @Column(name = "amount_minor", nullable = false, updatable = false)
     private long amountMinor;
 
+    /**
+     * The schema declares this column {@code CHAR(3)}, which PostgreSQL reports as {@code bpchar}.
+     * A bare {@code String} field defaults to {@code Types#VARCHAR}, and {@code ddl-auto=validate}
+     * treats CHAR and VARCHAR as different types - so without this annotation the context fails to
+     * start. Every fixed-width column in this schema (the other {@code currency} columns, and
+     * {@code idempotency_keys.request_hash}) needs the same treatment.
+     */
+    @JdbcTypeCode(SqlTypes.CHAR)
     @Column(name = "currency", nullable = false, updatable = false, length = 3)
     private String currency;
 
