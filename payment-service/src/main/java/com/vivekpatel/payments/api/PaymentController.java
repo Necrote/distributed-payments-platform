@@ -2,10 +2,14 @@ package com.vivekpatel.payments.api;
 
 import com.vivekpatel.payments.api.dto.CreatePaymentRequest;
 import com.vivekpatel.payments.api.dto.PaymentResponse;
+import com.vivekpatel.payments.domain.Money;
+import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.service.PaymentApplicationService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
+import java.net.URI;
 import java.util.UUID;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
@@ -17,10 +21,11 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 /**
- * The public API surface, exactly as specified in the project brief. Every method returns
- * {@code 501 Not Implemented} today; the guide fills them in one at a time.
+ * The public API surface, exactly as specified in the project brief. Endpoints not yet built
+ * return {@code 501 Not Implemented}; the guide fills them in one at a time.
  *
  * <p><b>Why the endpoints exist before the logic:</b> the shape of the API is a design decision and
  * belongs in the first commit, where a reviewer can argue with it. Writing the controller last is
@@ -36,8 +41,12 @@ import org.springframework.web.bind.annotation.RestController;
 @Tag(name = "Payments", description = "Create, inspect, capture and refund payments")
 public class PaymentController {
 
-    // TODO Phase 1 (Day 3): constructor-inject PaymentApplicationService here. Constructor
-    // injection, not @Autowired on a field: it makes the dependency visible in the test.
+    // Constructor injection, not @Autowired on a field: it makes the dependency visible in the test.
+    private final PaymentApplicationService paymentService;
+
+    public PaymentController(PaymentApplicationService paymentService) {
+        this.paymentService = paymentService;
+    }
 
     /**
      * Create a payment. The {@code Idempotency-Key} header is accepted from day one but is only
@@ -59,9 +68,20 @@ public class PaymentController {
                     @RequestHeader(value = "Idempotency-Key", required = false)
                     String idempotencyKey,
             @Valid @RequestBody CreatePaymentRequest request) {
-        // TODO Phase 1 (Day 3): persist a CREATED payment and return 201 + Location.
-        // TODO Phase 2 (Day 7): claim the idempotency key inside the same transaction.
-        return notImplemented();
+        // TODO Phase 2 (Day 7): claim the idempotency key inside the same transaction. The header
+        // is accepted but deliberately ignored until then.
+        Payment payment =
+                paymentService.create(
+                        request.merchantId(),
+                        Money.of(request.amount(), request.currency()),
+                        request.paymentMethodToken(),
+                        request.externalReference());
+        URI location =
+                ServletUriComponentsBuilder.fromCurrentRequest()
+                        .path("/{paymentId}")
+                        .buildAndExpand(payment.getId())
+                        .toUri();
+        return ResponseEntity.created(location).body(PaymentResponse.from(payment));
     }
 
     /** Fetch a payment by id. Phase 5 puts a Redis read-through cache in front of this path. */
