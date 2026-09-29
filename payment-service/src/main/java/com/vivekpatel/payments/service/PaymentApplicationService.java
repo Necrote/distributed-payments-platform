@@ -4,6 +4,7 @@ import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.persistence.PaymentRepository;
 import java.time.Clock;
+import java.util.UUID;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -33,5 +34,18 @@ public class PaymentApplicationService {
         Payment payment =
                 Payment.create(merchantId, amount, paymentMethodToken, externalReference, clock);
         return payments.save(payment);
+    }
+
+    /**
+     * Loads a payment by id.
+     *
+     * <p>{@code readOnly} lets Hibernate skip dirty checking at flush and tells the driver no writes
+     * are coming; it is a hint, not a lock.
+     *
+     * @throws PaymentNotFoundException if no payment has this id.
+     */
+    @Transactional(readOnly = true)
+    public Payment get(UUID paymentId) {
+        return payments.findById(paymentId).orElseThrow(() -> new PaymentNotFoundException(paymentId));
     }
 }
