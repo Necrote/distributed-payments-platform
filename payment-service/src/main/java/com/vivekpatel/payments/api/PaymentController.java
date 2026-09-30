@@ -7,11 +7,15 @@ import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import java.net.URI;
 import java.util.UUID;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -63,6 +67,13 @@ public class PaymentController {
      */
     @PostMapping
     @Operation(summary = "Create a payment (idempotent from Phase 2)")
+    @ApiResponse(responseCode = "201", description = "Created; Location header points at the payment")
+    @ApiResponse(
+            responseCode = "400",
+            description = "Invalid request; the `errors` property names each offending field",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
     public ResponseEntity<PaymentResponse> createPayment(
             @Parameter(description = "Client-generated key that makes this call safe to retry")
                     @RequestHeader(value = "Idempotency-Key", required = false)
@@ -87,9 +98,17 @@ public class PaymentController {
     /** Fetch a payment by id. Phase 5 puts a Redis read-through cache in front of this path. */
     @GetMapping("/{paymentId}")
     @Operation(summary = "Fetch a payment by id")
+    @ApiResponse(responseCode = "200", description = "The payment")
+    @ApiResponse(
+            responseCode = "404",
+            description = "No payment with this id",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
     public ResponseEntity<PaymentResponse> getPayment(@PathVariable UUID paymentId) {
-        // TODO Phase 1 (Day 4): 200 with the payment, or 404 as a ProblemDetail.
-        return notImplemented();
+        // Not-found is an exception, not an Optional here: ApiExceptionHandler owns the 404 shape,
+        // so every endpoint that loads a payment reports a missing one identically.
+        return ResponseEntity.ok(PaymentResponse.from(paymentService.get(paymentId)));
     }
 
     /**
