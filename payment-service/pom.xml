@@ -28,6 +28,13 @@
          its own artifact; forgetting the second dependency is the classic "no database found to
          handle jdbc:postgresql" startup failure. -->
     <flyway.version>10.17.3</flyway.version>
+    <!-- Two unrelated version numbers here: the Testcontainers LIBRARY version (this property) and
+         the Docker Engine HTTP API version the library puts in every request path (/v1.32/...).
+         Boot 3.3.5 manages Testcontainers 1.19.8, which always sends API 1.32. Docker Engine 29
+         rejects API versions below 1.40, so it fails with an empty "Status 400" and "Could not
+         find a valid Docker environment" while `docker ps` works fine. Testcontainers 1.21.4
+         defaults to API 1.44 instead, which Engine 29 accepts. -->
+    <testcontainers.version>1.21.4</testcontainers.version>
     <springdoc.version>2.6.0</springdoc.version>
     <resilience4j.version>2.2.0</resilience4j.version>
     <pitest.version>1.16.1</pitest.version>

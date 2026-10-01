@@ -144,7 +144,8 @@ public class Payment {
      * The ONLY way status may change. The state machine decides whether the move is legal; this
      * method just applies it.
      *
-     * @throws IllegalStateException if {@code target} is not reachable from the current status.
+     * @throws IllegalStateTransitionException if {@code target} is not reachable from the current
+     *     status.
      */
     public void transitionTo(PaymentStatus target, Clock clock) {
         this.status.assertCanTransitionTo(target);

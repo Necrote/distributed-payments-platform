@@ -98,12 +98,11 @@ public enum PaymentStatus {
      * Guard clause for service code: throws instead of returning a boolean, so a caller cannot
      * ignore the result by accident.
      *
-     * @throws IllegalStateException if the transition is not in the table.
+     * @throws IllegalStateTransitionException if the transition is not in the table.
      */
     public void assertCanTransitionTo(PaymentStatus target) {
         if (!canTransitionTo(target)) {
-            throw new IllegalStateException(
-                    "Illegal payment state transition: " + this + " -> " + target);
+            throw new IllegalStateTransitionException(this, target);
         }
     }
 

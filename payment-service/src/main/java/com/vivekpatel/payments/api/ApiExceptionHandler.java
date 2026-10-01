@@ -1,6 +1,7 @@
 package com.vivekpatel.payments.api;
 
 import com.fasterxml.jackson.databind.JsonMappingException;
+import com.vivekpatel.payments.domain.IllegalStateTransitionException;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.Comparator;
@@ -99,6 +100,21 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     public ProblemDetail handlePaymentNotFound(PaymentNotFoundException ex) {
         ProblemDetail body = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
         body.setTitle("Payment not found");
+        return body;
+    }
+
+    /**
+     * The request was well-formed but the payment is in the wrong state for it - capturing a
+     * {@code CREATED} payment, refunding an {@code AUTHORIZED} one. 409, not 400: the same request
+     * could succeed against the same resource once its state changes.
+     */
+    @ExceptionHandler(IllegalStateTransitionException.class)
+    public ProblemDetail handleIllegalTransition(IllegalStateTransitionException ex) {
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.CONFLICT,
+                "Payment is " + ex.getFrom() + " and cannot move to " + ex.getTo());
+        body.setTitle("Illegal payment state transition");
+        body.setProperty("currentStatus", ex.getFrom());
         return body;
     }
 
