@@ -13,8 +13,10 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.vivekpatel.payments.domain.IllegalStateTransitionException;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.domain.PaymentStatus;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import java.time.Clock;
@@ -164,6 +166,62 @@ class PaymentControllerTest {
                 .andExpect(status().isCreated())
                 .andExpect(header().string("Location", "http://localhost/payments/" + payment.getId()))
                 .andExpect(jsonPath("$.version").doesNotExist());
+    }
+
+    @Test
+    void captureOfACreatedPaymentIs409ProblemDetail() throws Exception {
+        UUID id = UUID.randomUUID();
+        when(paymentService.capture(id))
+                .thenThrow(new IllegalStateTransitionException(PaymentStatus.CREATED, PaymentStatus.CAPTURED));
+
+        mockMvc.perform(post("/payments/{id}/capture", id))
+                .andExpect(status().isConflict())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.status").value(409))
+                .andExpect(jsonPath("$.title").value("Illegal payment state transition"))
+                .andExpect(jsonPath("$.detail").value("Payment is CREATED and cannot move to CAPTURED"))
+                .andExpect(jsonPath("$.currentStatus").value("CREATED"))
+                .andExpect(jsonPath("$.instance").value("/payments/" + id + "/capture"));
+    }
+
+    @Test
+    void captureOfAnUnknownPaymentIs404() throws Exception {
+        UUID unknown = UUID.randomUUID();
+        when(paymentService.capture(unknown)).thenThrow(new PaymentNotFoundException(unknown));
+
+        mockMvc.perform(post("/payments/{id}/capture", unknown))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.title").value("Payment not found"));
+    }
+
+    @Test
+    void successfulCaptureAndRefundReturnTheUpdatedPayment() throws Exception {
+        Payment payment =
+                Payment.create("merchant-123", Money.of(12500, "INR"), "tok_test_123", "order-1", FIXED);
+        payment.transitionTo(PaymentStatus.PROCESSING, FIXED);
+        payment.transitionTo(PaymentStatus.AUTHORIZED, FIXED);
+        payment.transitionTo(PaymentStatus.CAPTURED, FIXED);
+        when(paymentService.capture(payment.getId())).thenReturn(payment);
+
+        mockMvc.perform(post("/payments/{id}/capture", payment.getId()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CAPTURED"))
+                .andExpect(jsonPath("$.version").doesNotExist());
+
+        payment.transitionTo(PaymentStatus.REFUND_PENDING, FIXED);
+        when(paymentService.refund(payment.getId())).thenReturn(payment);
+
+        mockMvc.perform(post("/payments/{id}/refund", payment.getId()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("REFUND_PENDING"));
+    }
+
+    @Test
+    void forceAuthorizeEndpointDoesNotExistUnlessEnabled() throws Exception {
+        // AdminPaymentController is not part of this slice, and is off by default everywhere else.
+        mockMvc.perform(post("/admin/payments/{id}/force-authorize", UUID.randomUUID()))
+                .andExpect(status().isNotFound());
+        verifyNoInteractions(paymentService);
     }
 
     @Test

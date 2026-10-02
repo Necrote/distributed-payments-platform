@@ -117,22 +117,54 @@ public class PaymentController {
      */
     @PostMapping("/{paymentId}/capture")
     @Operation(summary = "Capture an authorised payment")
+    @ApiResponse(responseCode = "200", description = "Captured")
+    @ApiResponse(
+            responseCode = "404",
+            description = "No payment with this id",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @ApiResponse(
+            responseCode = "409",
+            description = "The payment is not AUTHORIZED",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
     public ResponseEntity<PaymentResponse> capturePayment(
             @PathVariable UUID paymentId,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
-        // TODO Phase 1 (Day 5): AUTHORIZED -> CAPTURED through the state machine.
+        // TODO Phase 3 (Day 13): there is no processor yet, so a payment only reaches AUTHORIZED
+        // through the admin-forced authorisation in AdminPaymentController.
         // TODO Phase 2 (Day 10): optimistic locking must make the second concurrent call lose.
-        return notImplemented();
+        return ResponseEntity.ok(PaymentResponse.from(paymentService.capture(paymentId)));
     }
 
-    /** Refund a captured payment. Partial refunds are out of scope - say so in the README. */
+    /**
+     * Refund a captured payment. Partial refunds are out of scope - say so in the README.
+     *
+     * <p>Returns the payment in {@code REFUND_PENDING}: the refund is accepted, not yet confirmed.
+     */
     @PostMapping("/{paymentId}/refund")
     @Operation(summary = "Refund a captured payment (full refunds only)")
+    @ApiResponse(responseCode = "200", description = "Refund accepted; the payment is REFUND_PENDING")
+    @ApiResponse(
+            responseCode = "404",
+            description = "No payment with this id",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @ApiResponse(
+            responseCode = "409",
+            description = "The payment is not CAPTURED",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
     public ResponseEntity<PaymentResponse> refundPayment(
             @PathVariable UUID paymentId,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
-        // TODO Phase 1 (Day 5): CAPTURED -> REFUND_PENDING; the processor call arrives in Phase 3.
-        return notImplemented();
+        // TODO Phase 3: the processor call that moves REFUND_PENDING to REFUNDED (or back to
+        // CAPTURED) arrives with the simulator.
+        return ResponseEntity.ok(PaymentResponse.from(paymentService.refund(paymentId)));
     }
 
     /**
@@ -144,10 +176,6 @@ public class PaymentController {
     public ResponseEntity<Object> getLedger(@PathVariable UUID paymentId) {
         // TODO Phase 4 (Day 30): proxy or query the ledger service.
         return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).body(problem());
-    }
-
-    private static ResponseEntity<PaymentResponse> notImplemented() {
-        return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
     }
 
     private static ProblemDetail problem() {

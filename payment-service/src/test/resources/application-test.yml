@@ -1,0 +1,7 @@
+# Active in integration tests via @ActiveProfiles("test"). The datasource comes from the
+# Testcontainers @ServiceConnection, so nothing database-related belongs here.
+
+payments:
+  admin:
+    # Until Phase 3 there is no processor, and this is the only road to AUTHORIZED.
+    force-authorization-enabled: true
