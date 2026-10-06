@@ -5,7 +5,14 @@ dependencies, redelivered messages, and traffic that arrives faster than the dat
 
 Java 21 · Spring Boot 3 · PostgreSQL · Kafka · Redis · Kubernetes · Resilience4j · OpenTelemetry · Gatling
 
-> **Status: Phase 1 in progress.**
+[![ci](https://github.com/Necrote/distributed-payments-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Necrote/distributed-payments-platform/actions/workflows/ci.yml)
+
+> **Status: Phase 1 in progress.** `payment-service` runs end to end in Docker: create, fetch,
+> capture and refund through an enforced state machine, on PostgreSQL, tested in CI against a real
+> PostgreSQL. Idempotency, the processor integration, Kafka and the ledger are **not built yet**.
+> The rest of this README describes the target design; [the roadmap](#roadmap-and-honest-status)
+> says exactly which parts are real today.
+
 ---
 
 ## What problem does this solve?
@@ -23,6 +30,48 @@ every interesting failure happens between two systems rather than inside one:
 
 This project implements a payment lifecycle where each of those has a named, tested answer, and where
 you can reproduce the failure yourself in about thirty seconds.
+
+## Run it
+
+You need Docker. Nothing else - the image builds the service with its own JDK and Maven.
+
+```bash
+git clone https://github.com/Necrote/distributed-payments-platform.git
+cd distributed-payments-platform
+docker compose up -d --build --wait     # PostgreSQL + payment-service; returns once both are healthy
+```
+
+Create a payment (amounts are minor units - `12500 INR` is ₹125.00):
+
+```bash
+curl -i -X POST http://localhost:8080/payments \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-827361' \
+  -d '{"merchantId":"merchant-123","amount":12500,"currency":"INR","paymentMethodToken":"tok_test_123","externalReference":"order-827361"}'
+```
+
+```http
+HTTP/1.1 201
+Location: http://localhost:8080/payments/e440f939-9c4b-40ea-bdc6-8372845dea64
+
+{"id":"e440f939-...","merchantId":"merchant-123","amount":12500,"currency":"INR","status":"CREATED",...}
+```
+
+Then try the things that should fail, and see how they fail:
+
+```bash
+curl http://localhost:8080/payments/<id>                     # 200, the payment
+curl -X POST http://localhost:8080/payments/<id>/capture     # 409: CREATED cannot move to CAPTURED
+curl -X POST http://localhost:8080/payments -H 'Content-Type: application/json' \
+  -d '{"merchantId":"m","amount":1,"currency":"XYZ","paymentMethodToken":"t"}'   # 400, names the field
+```
+
+Every error is an RFC 7807 `application/problem+json` body. The full API is at
+<http://localhost:8080/swagger-ui.html>. On Windows PowerShell, `curl` is an alias for
+`Invoke-WebRequest`. Use `curl.exe` or Git Bash instead.
+
+Run the tests (unit tests plus integration tests against a throwaway PostgreSQL via Testcontainers;
+needs Docker and JDK 21): `cd payment-service && mvn verify`. Tear down with `docker compose down -v`.
 
 ## Architecture
 
@@ -126,12 +175,38 @@ significant amount of availability for a guarantee this domain does not need.
 
 ## Roadmap and honest status
 
+**Works today**
+
+- `POST /payments`, `GET /payments/{id}`, `POST /payments/{id}/capture`, `POST /payments/{id}/refund`.
+- A state machine that rejects illegal transitions with `409` and names the current status.
+- Money as `long` minor units + ISO-4217 currency, validated at the API (`400`, never a `500`).
+- PostgreSQL schema owned by Flyway; Hibernate only validates it.
+- Uniform RFC 7807 errors; OpenAPI/Swagger UI generated from the controllers.
+- CI on every push: unit tests and Testcontainers integration tests against a real PostgreSQL.
+- Multi-stage Docker image (JRE-only Alpine runtime, non-root user) and `docker compose up`.
+
+**Not built yet - and the gaps this leaves today**
+
+- **Idempotency.** The `Idempotency-Key` header is accepted and *ignored*. Retrying a `POST`
+  today creates a second payment. This is Phase 2, and it is the point of the project.
+- **No processor.** Nothing moves a payment from `CREATED` to `AUTHORIZED` in the running stack,
+  so capture and refund can only be reached in tests, through a temporary admin endpoint that is
+  disabled by default and is deleted in Phase 3. `processor-simulator` is scaffolded; its
+  endpoints return `501`.
+- **No Kafka, outbox or ledger.** `GET /payments/{id}/ledger` returns `501`. `ledger-service` is a
+  placeholder with no runnable logic.
+- **Concurrency is unproven.** The payment row carries a `@Version`, but no test yet races two
+  captures, and the losing request is not yet mapped to a clean `409`. Until then, "one winner"
+  is a design claim, not a demonstrated one.
+- No auth, no Redis, no metrics dashboards, no Kubernetes, no load-test numbers. Nothing on this
+  page is a performance claim.
+
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Payment lifecycle, state machine, PostgreSQL, OpenAPI, Docker | **In progress** |
+| 1 | Payment lifecycle, state machine, PostgreSQL, OpenAPI, Docker | **In progress**: everything listed under *works today* |
 | 2 | Idempotency, unique constraints, optimistic locking, concurrency tests | Not started |
-| 3 | Processor simulator, timeouts, retry, circuit breaker, bulkhead (`v0.1`) | Not started |
-| 4 | Kafka, transactional outbox, ledger service, idempotent consumers (`v0.2`) | Not started |
+| 3 | Processor simulator, timeouts, retry, circuit breaker, bulkhead (`v0.1`) | Scaffolded (endpoints return `501`) |
+| 4 | Kafka, transactional outbox, ledger service, idempotent consumers (`v0.2`) | Scaffolded (no runnable logic) |
 | 5 | Redis cache and idempotency acceleration, measured | Not started |
 | 6 | OpenTelemetry, Prometheus, Grafana, structured logging | Not started |
 | 7 | Kubernetes, Helm, probes, HPA scaling experiments | Not started |
