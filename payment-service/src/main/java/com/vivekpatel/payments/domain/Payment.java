@@ -7,7 +7,10 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import jakarta.persistence.Version;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.Objects;
 import java.util.UUID;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
@@ -15,9 +18,8 @@ import org.hibernate.type.SqlTypes;
 /**
  * The aggregate root. One row in {@code payments}, one payment lifecycle.
  *
- * <p><b>Phase 1 TODOs are marked inline.</b> The fields and the mapping are drafted so the shape of
- * the aggregate is settled before you write behaviour; the behaviour itself is yours to write on
- * Day 3 and Day 10.
+ * <p>State changes go through exactly two doors: {@link #create} for birth and {@link #transitionTo}
+ * for everything after. There are no setters.
  *
  * <p>Three mapping decisions that carry weight in an interview:
  *
@@ -80,10 +82,16 @@ public class Payment {
      * Optimistic locking. Hibernate adds {@code AND version = ?} to every UPDATE and throws
      * {@code OptimisticLockingFailureException} when zero rows change. Do not catch that exception
      * and retry blindly - decide per operation whether a retry is safe (Day 10).
+     *
+     * <p>A wrapper {@code Long}, not a primitive, on purpose. The id is assigned by us before the
+     * first save, so Spring Data cannot use "id is null" to tell a new entity from an existing one.
+     * It falls back to the version: {@code null} means new, so {@code save()} calls
+     * {@code persist()}. With a primitive {@code long} it would call {@code merge()} and issue a
+     * wasted SELECT before every INSERT. Hibernate sets the version to 0 on persist.
      */
     @Version
     @Column(name = "version", nullable = false)
-    private long version;
+    private Long version;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
@@ -95,25 +103,64 @@ public class Payment {
     protected Payment() {
     }
 
-    // TODO Phase 1 (Day 3): add a real constructor or a static factory that takes
-    // (merchantId, Money, paymentMethodToken, externalReference), assigns a UUID, sets status to
-    // CREATED and stamps createdAt/updatedAt. Keep every other mutator package-private or absent -
-    // an aggregate you can mutate from anywhere is not an aggregate.
+    /**
+     * The only way to bring a payment into existence. The id is ours, never the caller's, and every
+     * payment starts life as {@link PaymentStatus#CREATED}.
+     *
+     * <p>Takes a {@link Clock} rather than calling {@code Instant.now()} so tests can pin time and
+     * assert on timestamps without sleeping.
+     */
+    public static Payment create(
+            String merchantId,
+            Money amount,
+            String paymentMethodToken,
+            String externalReference,
+            Clock clock) {
+        Objects.requireNonNull(merchantId, "merchantId");
+        Objects.requireNonNull(amount, "amount");
+        Objects.requireNonNull(paymentMethodToken, "paymentMethodToken");
+        Objects.requireNonNull(clock, "clock");
+        // The table has a CHECK for this too, but failing here gives a clear exception instead of a
+        // constraint-violation stack trace from inside the flush.
+        if (!amount.isPositive()) {
+            throw new IllegalArgumentException("amount must be positive, was " + amount.minorUnits());
+        }
+
+        Instant now = now(clock);
+        Payment payment = new Payment();
+        payment.id = UUID.randomUUID();
+        payment.merchantId = merchantId;
+        payment.amountMinor = amount.minorUnits();
+        payment.currency = amount.currencyCode();
+        payment.paymentMethodToken = paymentMethodToken;
+        payment.externalReference = externalReference;
+        payment.status = PaymentStatus.CREATED;
+        payment.createdAt = now;
+        payment.updatedAt = now;
+        return payment;
+    }
 
     /**
-     * TODO Phase 1 (Day 3): the ONLY way status may change.
+     * The ONLY way status may change. The state machine decides whether the move is legal; this
+     * method just applies it.
      *
-     * <pre>
-     * public void transitionTo(PaymentStatus target, Clock clock) {
-     *     this.status.assertCanTransitionTo(target);
-     *     this.status = target;
-     *     this.updatedAt = Instant.now(clock);
-     * }
-     * </pre>
-     *
-     * Inject a {@link java.time.Clock} rather than calling {@code Instant.now()} directly, so the
-     * tests you write on Day 5 can assert on timestamps without sleeping.
+     * @throws IllegalStateTransitionException if {@code target} is not reachable from the current
+     *     status.
      */
+    public void transitionTo(PaymentStatus target, Clock clock) {
+        this.status.assertCanTransitionTo(target);
+        this.status = target;
+        this.updatedAt = now(clock);
+    }
+
+    /**
+     * PostgreSQL {@code TIMESTAMPTZ} stores microseconds; {@code Instant.now()} can carry
+     * nanoseconds. Truncating here means the object the create call returns has the same timestamps
+     * a later read of the row will return.
+     */
+    private static Instant now(Clock clock) {
+        return Instant.now(clock).truncatedTo(ChronoUnit.MICROS);
+    }
 
     public UUID getId() {
         return id;
@@ -139,7 +186,8 @@ public class Payment {
         return externalReference;
     }
 
-    public long getVersion() {
+    /** {@code null} until the payment has been persisted for the first time. */
+    public Long getVersion() {
         return version;
     }
 

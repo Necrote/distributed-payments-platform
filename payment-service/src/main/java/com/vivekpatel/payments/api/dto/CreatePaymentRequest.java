@@ -1,8 +1,8 @@
 package com.vivekpatel.payments.api.dto;
 
+import com.vivekpatel.payments.api.validation.IsoCurrencyCode;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 /**
@@ -27,8 +27,7 @@ import jakarta.validation.constraints.Size;
 public record CreatePaymentRequest(
         @NotBlank @Size(max = 64) String merchantId,
         @Min(1) long amount,
-        @NotBlank @Pattern(regexp = "^[A-Z]{3}$", message = "must be a 3-letter ISO-4217 code")
-                String currency,
+        @NotBlank @IsoCurrencyCode String currency,
         @NotBlank @Size(max = 128) String paymentMethodToken,
         @Size(max = 128) String externalReference) {
 }

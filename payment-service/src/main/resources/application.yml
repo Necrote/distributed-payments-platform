@@ -77,6 +77,10 @@ payments:
     read-timeout: 2s                # must be < the client-facing SLO, or the caller times out first
   idempotency:
     key-ttl: 24h                    # how long a replayed key returns the original response
+  admin:
+    # POST /admin/payments/{id}/force-authorize: AUTHORIZED without a processor. Off everywhere
+    # except the test profile; deleted in Phase 3 (Day 13) when real authorisation exists.
+    force-authorization-enabled: false
 
 # Phase 3 (Day 15-17). Left commented so the first commit does not claim resilience it has not
 # demonstrated; the guide switches these on one at a time, each with a failure scenario.
