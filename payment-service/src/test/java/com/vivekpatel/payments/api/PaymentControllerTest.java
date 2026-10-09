@@ -4,6 +4,9 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -160,12 +163,29 @@ class PaymentControllerTest {
     void validCreateIs201WithLocation() throws Exception {
         Payment payment =
                 Payment.create("merchant-123", Money.of(12500, "INR"), "tok_test_123", "order-1", FIXED);
-        when(paymentService.create(any(), any(), any(), any())).thenReturn(payment);
+        when(paymentService.create(any(), any(), any(), any(), any())).thenReturn(payment);
 
         mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
                 .andExpect(status().isCreated())
                 .andExpect(header().string("Location", "http://localhost/payments/" + payment.getId()))
                 .andExpect(jsonPath("$.version").doesNotExist());
+        verify(paymentService)
+                .create(eq("merchant-123"), eq(Money.of(12500, "INR")), eq("tok_test_123"),
+                        eq("order-827361"), isNull());
+    }
+
+    @Test
+    void idempotencyKeyHeaderIsPassedToTheService() throws Exception {
+        Payment payment =
+                Payment.create("merchant-123", Money.of(12500, "INR"), "tok_test_123", "order-1", FIXED);
+        when(paymentService.create(any(), any(), any(), any(), any())).thenReturn(payment);
+
+        mockMvc.perform(post("/payments")
+                        .header("Idempotency-Key", "key-7f3a")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_BODY))
+                .andExpect(status().isCreated());
+        verify(paymentService).create(any(), any(), any(), any(), eq("key-7f3a"));
     }
 
     @Test

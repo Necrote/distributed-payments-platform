@@ -79,14 +79,15 @@ public class PaymentController {
                     @RequestHeader(value = "Idempotency-Key", required = false)
                     String idempotencyKey,
             @Valid @RequestBody CreatePaymentRequest request) {
-        // TODO Phase 2 (Day 7): claim the idempotency key inside the same transaction. The header
-        // is accepted but deliberately ignored until then.
+        // The key is claimed inside the create transaction. TODO Phase 2 (Day 8-9): a repeated key
+        // still fails on the UNIQUE constraint instead of replaying or returning 422.
         Payment payment =
                 paymentService.create(
                         request.merchantId(),
                         Money.of(request.amount(), request.currency()),
                         request.paymentMethodToken(),
-                        request.externalReference());
+                        request.externalReference(),
+                        idempotencyKey);
         URI location =
                 ServletUriComponentsBuilder.fromCurrentRequest()
                         .path("/{paymentId}")

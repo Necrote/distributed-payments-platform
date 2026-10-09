@@ -12,14 +12,18 @@ import com.jayway.jsonpath.JsonPath;
 import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.domain.PaymentStatus;
 import com.vivekpatel.payments.persistence.PaymentRepository;
+import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
+import org.skyscreamer.jsonassert.JSONAssert;
+import org.skyscreamer.jsonassert.JSONCompareMode;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -72,6 +76,9 @@ class PaymentControllerIT {
 
     @Autowired
     PaymentRepository payments;
+
+    @Autowired
+    JdbcTemplate jdbc;
 
     @Test
     void createThenFetchReturnsTheSamePayment() throws Exception {
@@ -144,6 +151,53 @@ class PaymentControllerIT {
         mockMvc.perform(post("/payments/{id}/refund", id))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.currentStatus").value("AUTHORIZED"));
+    }
+
+    @Test
+    void createWithAnIdempotencyKeyWritesTheKeyRowAndThePayment() throws Exception {
+        String key = "key-" + UUID.randomUUID();
+        MvcResult created =
+                mockMvc.perform(post("/payments")
+                                .header("Idempotency-Key", key)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(VALID_BODY))
+                        .andExpect(status().isCreated())
+                        .andReturn();
+        String responseBody = created.getResponse().getContentAsString();
+        UUID id = UUID.fromString(JsonPath.read(responseBody, "$.id"));
+
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM payments WHERE id = ?", Long.class, id))
+                .isOne();
+        Map<String, Object> row = jdbc.queryForMap(
+                """
+                SELECT payment_id, response_status, request_hash,
+                       jsonb_typeof(response_body) AS body_type,
+                       response_body ->> 'id' AS body_id,
+                       extract(epoch FROM expires_at - created_at)::bigint AS ttl_seconds
+                FROM idempotency_keys WHERE merchant_id = 'merchant-123' AND idempotency_key = ?
+                """,
+                key);
+        assertThat(row.get("payment_id")).isEqualTo(id);
+        assertThat(row.get("response_status")).isEqualTo(201);
+        assertThat((String) row.get("request_hash")).matches("[0-9a-f]{64}");
+        // An object, not a JSON string containing an object: the body was not double-encoded.
+        assertThat(row.get("body_type")).isEqualTo("object");
+        assertThat(row.get("body_id")).isEqualTo(id.toString());
+        assertThat(row.get("ttl_seconds")).isEqualTo(24L * 60 * 60);
+
+        String storedBody = jdbc.queryForObject(
+                "SELECT response_body::text FROM idempotency_keys WHERE idempotency_key = ?",
+                String.class, key);
+        JSONAssert.assertEquals(responseBody, storedBody, JSONCompareMode.STRICT);
+    }
+
+    @Test
+    void createWithoutAnIdempotencyKeyWritesNoKeyRow() throws Exception {
+        UUID id = createPayment();
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT count(*) FROM idempotency_keys WHERE payment_id = ?", Long.class, id))
+                .isZero();
     }
 
     @Test
