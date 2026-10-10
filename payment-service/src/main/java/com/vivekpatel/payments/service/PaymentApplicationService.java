@@ -11,6 +11,7 @@ import com.vivekpatel.payments.persistence.IdempotencyKeyRepository;
 import com.vivekpatel.payments.persistence.PaymentRepository;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
@@ -53,8 +54,9 @@ public class PaymentApplicationService {
      * <p>With an {@code idempotencyKey}, the same transaction also inserts the key row and records
      * the response a retry should get. Without one, only the payment is written.
      *
-     * <p>TODO Phase 2 (Day 8-9): a key that already exists currently fails on the UNIQUE constraint
-     * and surfaces as a 500. Replay (same hash) and 422 (different hash) arrive next.
+     * <p>A key that already exists fails here with a {@code DataIntegrityViolationException}, and
+     * this transaction rolls back. Turning that into a replay is {@link IdempotentPaymentCreator}'s
+     * job, outside this transaction - see there for why it cannot be done in here.
      */
     @Transactional
     public Payment create(
@@ -78,12 +80,7 @@ public class PaymentApplicationService {
         IdempotencyKey claim = null;
         if (idempotencyKey != null) {
             String requestHash =
-                    CanonicalRequestHash.of(new CreatePaymentFingerprint(
-                            merchantId,
-                            amount.minorUnits(),
-                            amount.currencyCode(),
-                            paymentMethodToken,
-                            externalReference));
+                    requestHash(merchantId, amount, paymentMethodToken, externalReference);
             // Flushed now, not at commit, so a duplicate fails here before any payment is written.
             claim = idempotencyKeys.saveAndFlush(
                     IdempotencyKey.claim(merchantId, idempotencyKey, requestHash, keyTtl, clock));
@@ -166,6 +163,29 @@ public class PaymentApplicationService {
         payment.transitionTo(PaymentStatus.PROCESSING, clock);
         payment.transitionTo(PaymentStatus.AUTHORIZED, clock);
         return payment;
+    }
+
+    /**
+     * The stored idempotency row for this merchant and key, in its own read-only transaction.
+     *
+     * <p>Called after a create has failed on the duplicate key, so the transaction that failed is
+     * already gone. A fresh transaction under READ COMMITTED takes a fresh snapshot, which is what
+     * makes the winner's just-committed row visible here.
+     */
+    @Transactional(readOnly = true)
+    public Optional<IdempotencyKey> findIdempotencyKey(String merchantId, String idempotencyKey) {
+        return idempotencyKeys.findByMerchantIdAndIdempotencyKey(merchantId, idempotencyKey);
+    }
+
+    /** SHA-256 of the canonical create request; the value stored in {@code request_hash}. */
+    static String requestHash(
+            String merchantId, Money amount, String paymentMethodToken, String externalReference) {
+        return CanonicalRequestHash.of(new CreatePaymentFingerprint(
+                merchantId,
+                amount.minorUnits(),
+                amount.currencyCode(),
+                paymentMethodToken,
+                externalReference));
     }
 
     private Payment load(UUID paymentId) {
