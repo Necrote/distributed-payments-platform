@@ -201,11 +201,63 @@ class PaymentControllerIT {
     }
 
     @Test
-    @Disabled("TODO Phase 2 (Day 8)")
     void sameIdempotencyKeyTwiceCreatesOnePayment() throws Exception {
-        // TODO Phase 2 (Day 8): POST the identical body twice with the same Idempotency-Key.
-        //   Expect 201 then 200, the SAME payment id, and exactly one row in `payments`.
-        //   This is the test that proves the flagship feature - write it before the implementation.
+        // A merchant of its own, so "one row in payments" counts only this test's writes.
+        String merchant = "merchant-" + UUID.randomUUID();
+        String body = VALID_BODY.replace("merchant-123", merchant);
+        String key = "key-" + UUID.randomUUID();
+
+        MvcResult first =
+                mockMvc.perform(post("/payments")
+                                .header("Idempotency-Key", key)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(body))
+                        .andExpect(status().isCreated())
+                        .andExpect(header().exists("Location"))
+                        .andExpect(header().doesNotExist("Idempotent-Replayed"))
+                        .andReturn();
+        MvcResult second =
+                mockMvc.perform(post("/payments")
+                                .header("Idempotency-Key", key)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(body))
+                        .andExpect(status().isOk())
+                        .andExpect(header().string("Idempotent-Replayed", "true"))
+                        .andReturn();
+
+        // Byte-identical, not just the same id: the replay is the first response, not a fresh
+        // rendering of the payment's current state.
+        assertThat(second.getResponse().getContentAsString())
+                .isEqualTo(first.getResponse().getContentAsString());
+        assertThat(jdbc.queryForObject(
+                        "SELECT count(*) FROM payments WHERE merchant_id = ?", Long.class, merchant))
+                .isOne();
+        assertThat(jdbc.queryForObject(
+                        "SELECT count(*) FROM idempotency_keys WHERE merchant_id = ?", Long.class, merchant))
+                .isOne();
+    }
+
+    @Test
+    void replayReturnsTheOriginalResponseEvenAfterThePaymentHasMoved() throws Exception {
+        String key = "key-" + UUID.randomUUID();
+        MvcResult first =
+                mockMvc.perform(post("/payments")
+                                .header("Idempotency-Key", key)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(VALID_BODY))
+                        .andExpect(status().isCreated())
+                        .andReturn();
+        String id = JsonPath.read(first.getResponse().getContentAsString(), "$.id");
+        mockMvc.perform(post("/admin/payments/{id}/force-authorize", id)).andExpect(status().isOk());
+
+        // The retry asks "what happened to my create?" - and the create returned CREATED.
+        mockMvc.perform(post("/payments")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(id))
+                .andExpect(jsonPath("$.status").value("CREATED"));
     }
 
     @Test

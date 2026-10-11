@@ -20,6 +20,9 @@ import com.vivekpatel.payments.domain.IllegalStateTransitionException;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.domain.PaymentStatus;
+import com.vivekpatel.payments.api.dto.PaymentResponse;
+import com.vivekpatel.payments.service.CreatePaymentResult;
+import com.vivekpatel.payments.service.IdempotentPaymentCreator;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import java.time.Clock;
@@ -61,6 +64,9 @@ class PaymentControllerTest {
     @MockBean
     PaymentApplicationService paymentService;
 
+    @MockBean
+    IdempotentPaymentCreator paymentCreator;
+
     @Test
     void getKnownPaymentReturnsTheDtoWithoutEntityInternals() throws Exception {
         Payment payment =
@@ -96,7 +102,7 @@ class PaymentControllerTest {
         mockMvc.perform(get("/payments/{id}", "not-a-uuid"))
                 .andExpect(status().isBadRequest())
                 .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON));
-        verifyNoInteractions(paymentService);
+        verifyNoInteractions(paymentService, paymentCreator);
     }
 
     @Test
@@ -110,7 +116,7 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.errors", hasSize(1)))
                 .andExpect(jsonPath("$.errors[0].field").value("merchantId"))
                 .andExpect(jsonPath("$.errors[0].message").value("must not be blank"));
-        verifyNoInteractions(paymentService);
+        verifyNoInteractions(paymentService, paymentCreator);
     }
 
     @Test
@@ -136,7 +142,7 @@ class PaymentControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.errors[0].field").value("currency"))
                 .andExpect(jsonPath("$.errors[0].message").value("must be a 3-letter ISO-4217 code"));
-        verifyNoInteractions(paymentService);
+        verifyNoInteractions(paymentService, paymentCreator);
     }
 
     @Test
@@ -163,13 +169,15 @@ class PaymentControllerTest {
     void validCreateIs201WithLocation() throws Exception {
         Payment payment =
                 Payment.create("merchant-123", Money.of(12500, "INR"), "tok_test_123", "order-1", FIXED);
-        when(paymentService.create(any(), any(), any(), any(), any())).thenReturn(payment);
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenReturn(new CreatePaymentResult.Created(payment));
 
         mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
                 .andExpect(status().isCreated())
                 .andExpect(header().string("Location", "http://localhost/payments/" + payment.getId()))
+                .andExpect(header().doesNotExist("Idempotent-Replayed"))
                 .andExpect(jsonPath("$.version").doesNotExist());
-        verify(paymentService)
+        verify(paymentCreator)
                 .create(eq("merchant-123"), eq(Money.of(12500, "INR")), eq("tok_test_123"),
                         eq("order-827361"), isNull());
     }
@@ -178,14 +186,34 @@ class PaymentControllerTest {
     void idempotencyKeyHeaderIsPassedToTheService() throws Exception {
         Payment payment =
                 Payment.create("merchant-123", Money.of(12500, "INR"), "tok_test_123", "order-1", FIXED);
-        when(paymentService.create(any(), any(), any(), any(), any())).thenReturn(payment);
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenReturn(new CreatePaymentResult.Created(payment));
 
         mockMvc.perform(post("/payments")
                         .header("Idempotency-Key", "key-7f3a")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(VALID_BODY))
                 .andExpect(status().isCreated());
-        verify(paymentService).create(any(), any(), any(), any(), eq("key-7f3a"));
+        verify(paymentCreator).create(any(), any(), any(), any(), eq("key-7f3a"));
+    }
+
+    @Test
+    void replayIs200WithTheOriginalBodyAndNoLocation() throws Exception {
+        Payment payment =
+                Payment.create("merchant-123", Money.of(12500, "INR"), "tok_test_123", "order-1", FIXED);
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenReturn(new CreatePaymentResult.Replayed(PaymentResponse.from(payment)));
+
+        mockMvc.perform(post("/payments")
+                        .header("Idempotency-Key", "key-7f3a")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_BODY))
+                // 200, not 201: the first call created the resource, this one created nothing.
+                .andExpect(status().isOk())
+                .andExpect(header().string("Idempotent-Replayed", "true"))
+                .andExpect(header().doesNotExist("Location"))
+                .andExpect(jsonPath("$.id").value(payment.getId().toString()))
+                .andExpect(jsonPath("$.version").doesNotExist());
     }
 
     @Test
@@ -241,7 +269,7 @@ class PaymentControllerTest {
         // AdminPaymentController is not part of this slice, and is off by default everywhere else.
         mockMvc.perform(post("/admin/payments/{id}/force-authorize", UUID.randomUUID()))
                 .andExpect(status().isNotFound());
-        verifyNoInteractions(paymentService);
+        verifyNoInteractions(paymentService, paymentCreator);
     }
 
     @Test

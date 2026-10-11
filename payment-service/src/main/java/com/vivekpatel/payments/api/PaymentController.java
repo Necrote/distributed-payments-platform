@@ -4,6 +4,8 @@ import com.vivekpatel.payments.api.dto.CreatePaymentRequest;
 import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.service.CreatePaymentResult;
+import com.vivekpatel.payments.service.IdempotentPaymentCreator;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -45,29 +47,37 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 @Tag(name = "Payments", description = "Create, inspect, capture and refund payments")
 public class PaymentController {
 
+    static final String REPLAYED_HEADER = "Idempotent-Replayed";
+
     // Constructor injection, not @Autowired on a field: it makes the dependency visible in the test.
     private final PaymentApplicationService paymentService;
+    private final IdempotentPaymentCreator paymentCreator;
 
-    public PaymentController(PaymentApplicationService paymentService) {
+    public PaymentController(
+            PaymentApplicationService paymentService, IdempotentPaymentCreator paymentCreator) {
         this.paymentService = paymentService;
+        this.paymentCreator = paymentCreator;
     }
 
     /**
-     * Create a payment. The {@code Idempotency-Key} header is accepted from day one but is only
-     * enforced in Phase 2 - see ADR-004.
-     *
-     * <p>Target behaviour once implemented:
+     * Create a payment. The {@code Idempotency-Key} header is optional until Phase 2 makes it
+     * required - see ADR-004.
      *
      * <ul>
      *   <li>{@code 201 Created} with a {@code Location} header for a new payment;</li>
      *   <li>{@code 200 OK} with the original body when the same key and the same payload arrive
-     *       again;</li>
-     *   <li>{@code 422 Unprocessable Entity} when the same key arrives with a different payload.</li>
+     *       again - 200, not 201, because this call created nothing;</li>
+     *   <li>TODO Phase 2 (Day 9): {@code 422 Unprocessable Entity} when the same key arrives with a
+     *       different payload. Detected and refused today, but reported as a 500.</li>
      * </ul>
      */
     @PostMapping
-    @Operation(summary = "Create a payment (idempotent from Phase 2)")
+    @Operation(summary = "Create a payment (idempotent with an Idempotency-Key)")
     @ApiResponse(responseCode = "201", description = "Created; Location header points at the payment")
+    @ApiResponse(
+            responseCode = "200",
+            description = "Replay: this key and payload already created a payment; its original body. "
+                    + "Carries `" + REPLAYED_HEADER + ": true`")
     @ApiResponse(
             responseCode = "400",
             description = "Invalid request; the `errors` property names each offending field",
@@ -79,21 +89,27 @@ public class PaymentController {
                     @RequestHeader(value = "Idempotency-Key", required = false)
                     String idempotencyKey,
             @Valid @RequestBody CreatePaymentRequest request) {
-        // The key is claimed inside the create transaction. TODO Phase 2 (Day 8-9): a repeated key
-        // still fails on the UNIQUE constraint instead of replaying or returning 422.
-        Payment payment =
-                paymentService.create(
+        CreatePaymentResult result =
+                paymentCreator.create(
                         request.merchantId(),
                         Money.of(request.amount(), request.currency()),
                         request.paymentMethodToken(),
                         request.externalReference(),
                         idempotencyKey);
-        URI location =
-                ServletUriComponentsBuilder.fromCurrentRequest()
-                        .path("/{paymentId}")
-                        .buildAndExpand(payment.getId())
-                        .toUri();
-        return ResponseEntity.created(location).body(PaymentResponse.from(payment));
+        return switch (result) {
+            case CreatePaymentResult.Created(Payment payment) -> {
+                URI location =
+                        ServletUriComponentsBuilder.fromCurrentRequest()
+                                .path("/{paymentId}")
+                                .buildAndExpand(payment.getId())
+                                .toUri();
+                yield ResponseEntity.created(location).body(PaymentResponse.from(payment));
+            }
+            // The header lets a client (and whoever reads its logs) tell a replay from a fresh
+            // success without comparing ids.
+            case CreatePaymentResult.Replayed(PaymentResponse original) ->
+                    ResponseEntity.ok().header(REPLAYED_HEADER, "true").body(original);
+        };
     }
 
     /** Fetch a payment by id. Phase 5 puts a Redis read-through cache in front of this path. */
