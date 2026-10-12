@@ -4,7 +4,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.vivekpatel.payments.domain.Money;
+import com.vivekpatel.payments.domain.Payment;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -12,14 +22,16 @@ import org.springframework.boot.testcontainers.service.connection.ServiceConnect
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.transaction.IllegalTransactionStateException;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 /**
- * Transaction boundaries of {@link PaymentApplicationService}, against real PostgreSQL. Called
- * directly rather than over HTTP, so a test can hand it input the controller's validation would
- * have rejected.
+ * Transaction boundaries of {@link PaymentApplicationService} and {@link IdempotentPaymentCreator},
+ * against real PostgreSQL. Called directly rather than over HTTP, so a test can hold a transaction
+ * open, run requests on several threads, or hand in input the controller would have rejected.
  */
 @SpringBootTest
 @ActiveProfiles("test")
@@ -30,8 +42,16 @@ class PaymentApplicationServiceIT {
     @ServiceConnection
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
 
+    private static final Money AMOUNT = Money.of(12500, "INR");
+
     @Autowired
     PaymentApplicationService service;
+
+    @Autowired
+    IdempotentPaymentCreator creator;
+
+    @Autowired
+    TransactionTemplate tx;
 
     @Autowired
     JdbcTemplate jdbc;
@@ -46,7 +66,7 @@ class PaymentApplicationServiceIT {
         String tooLongToken = "t".repeat(129);
 
         assertThatThrownBy(() -> service.create(
-                        "merchant-rollback", Money.of(12500, "INR"), tooLongToken, null, key))
+                        "merchant-rollback", AMOUNT, tooLongToken, null, key))
                 .isInstanceOf(DataIntegrityViolationException.class);
 
         assertThat(jdbc.queryForObject(
@@ -55,5 +75,135 @@ class PaymentApplicationServiceIT {
         assertThat(jdbc.queryForObject(
                         "SELECT count(*) FROM payments WHERE merchant_id = 'merchant-rollback'", Long.class))
                 .isZero();
+    }
+
+    @Test
+    void retryWhileTheFirstIsInFlightWaitsThenReplaysItsPayment() throws Exception {
+        String merchant = "merchant-" + UUID.randomUUID();
+        String key = "key-" + UUID.randomUUID();
+        ExecutorService retryThread = Executors.newSingleThreadExecutor();
+        try {
+            CompletableFuture<CreatePaymentResult> retry = new CompletableFuture<>();
+            Payment first = tx.execute(status -> {
+                // The first request: key row flushed, transaction NOT committed.
+                Payment created = service.create(merchant, AMOUNT, "tok", null, key);
+                retryThread.submit(() -> complete(retry,
+                        () -> creator.create(merchant, AMOUNT, "tok", null, key)));
+                // Prove the retry is parked on the unique index, not merely slow.
+                awaitABackendBlockedOnALock();
+                assertThat(retry).isNotDone();
+                return created;
+            });
+            // First commits -> the retry's INSERT fails -> fresh read -> replay.
+
+            CreatePaymentResult result = retry.get(10, TimeUnit.SECONDS);
+            assertThat(result).isInstanceOf(CreatePaymentResult.Replayed.class);
+            assertThat(((CreatePaymentResult.Replayed) result).response().id()).isEqualTo(first.getId());
+            assertThat(paymentCount(merchant)).isOne();
+        } finally {
+            retryThread.shutdownNow();
+        }
+    }
+
+    @Test
+    void retryWhileTheFirstIsInFlightCreatesThePaymentIfTheFirstRollsBack() throws Exception {
+        String merchant = "merchant-" + UUID.randomUUID();
+        String key = "key-" + UUID.randomUUID();
+        ExecutorService retryThread = Executors.newSingleThreadExecutor();
+        try {
+            CompletableFuture<CreatePaymentResult> retry = new CompletableFuture<>();
+            tx.executeWithoutResult(status -> {
+                service.create(merchant, AMOUNT, "tok", null, key);
+                retryThread.submit(() -> complete(retry,
+                        () -> creator.create(merchant, AMOUNT, "tok", null, key)));
+                awaitABackendBlockedOnALock();
+                status.setRollbackOnly();
+            });
+            // First rolls back -> its key row never existed -> the retry's INSERT goes through.
+
+            assertThat(retry.get(10, TimeUnit.SECONDS)).isInstanceOf(CreatePaymentResult.Created.class);
+            assertThat(paymentCount(merchant)).isOne();
+        } finally {
+            retryThread.shutdownNow();
+        }
+    }
+
+    @Test
+    void manySimultaneousRequestsWithOneKeyCreateExactlyOnePayment() throws Exception {
+        // Below the pool size of 10, so every thread can hold a connection at the same time.
+        int threads = 8;
+        String merchant = "merchant-" + UUID.randomUUID();
+        String key = "key-" + UUID.randomUUID();
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        try {
+            List<CompletableFuture<CreatePaymentResult>> results = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                CompletableFuture<CreatePaymentResult> result = new CompletableFuture<>();
+                results.add(result);
+                pool.submit(() -> {
+                    start.await();
+                    complete(result, () -> creator.create(merchant, AMOUNT, "tok", null, key));
+                    return null;
+                });
+            }
+            start.countDown();
+
+            List<UUID> ids = new ArrayList<>();
+            int created = 0;
+            for (CompletableFuture<CreatePaymentResult> f : results) {
+                switch (f.get(30, TimeUnit.SECONDS)) {
+                    case CreatePaymentResult.Created c -> {
+                        created++;
+                        ids.add(c.payment().getId());
+                    }
+                    case CreatePaymentResult.Replayed r -> ids.add(r.response().id());
+                }
+            }
+            assertThat(created).isOne();
+            assertThat(ids).hasSize(threads).containsOnly(ids.get(0));
+            assertThat(paymentCount(merchant)).isOne();
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void creatorRefusesToRunInsideAnExistingTransaction() {
+        // Inside an outer transaction the duplicate-key violation would poison the very
+        // transaction the recovery read needs. NEVER makes that a loud mistake.
+        assertThatThrownBy(() -> tx.executeWithoutResult(status ->
+                        creator.create("m-never", AMOUNT, "tok", null, "key-" + UUID.randomUUID())))
+                .isInstanceOf(IllegalTransactionStateException.class);
+    }
+
+    private long paymentCount(String merchant) {
+        return jdbc.queryForObject("SELECT count(*) FROM payments WHERE merchant_id = ?", Long.class, merchant);
+    }
+
+    /** Polls pg_stat_activity until some backend is waiting on a lock - our blocked INSERT. */
+    private void awaitABackendBlockedOnALock() {
+        Instant deadline = Instant.now().plus(Duration.ofSeconds(10));
+        while (Instant.now().isBefore(deadline)) {
+            Long waiting = jdbc.queryForObject(
+                    "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'", Long.class);
+            if (waiting != null && waiting > 0) {
+                return;
+            }
+            Thread.onSpinWait();
+        }
+        throw new AssertionError("No backend ever blocked on the unique index");
+    }
+
+    private interface Call<T> {
+        T run() throws Exception;
+    }
+
+    private static <T> void complete(CompletableFuture<T> future, Call<T> call) {
+        try {
+            future.complete(call.run());
+        } catch (Throwable t) {
+            future.completeExceptionally(t);
+        }
     }
 }
