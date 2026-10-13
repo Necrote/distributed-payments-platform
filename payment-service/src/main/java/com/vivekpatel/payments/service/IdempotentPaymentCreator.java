@@ -5,6 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
 import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
@@ -76,11 +79,41 @@ public class IdempotentPaymentCreator {
                             "Idempotency key vanished after a duplicate-key violation", e));
             String requestHash = PaymentApplicationService.requestHash(
                     merchantId, amount, paymentMethodToken, externalReference);
+            PaymentResponse original = replay(stored);
+            // The safety property. Same key + different body is a client bug; replaying here would
+            // tell a client that sent 999 it charged 999, when the stored payment is for 12500.
             if (!stored.getRequestHash().equals(requestHash)) {
-                throw new IdempotencyKeyReusedException(idempotencyKey);
+                throw new IdempotencyKeyReusedException(
+                        idempotencyKey, original.id(),
+                        differingFields(original, amount, externalReference));
             }
-            return new CreatePaymentResult.Replayed(replay(stored));
+            return new CreatePaymentResult.Replayed(original);
         }
+    }
+
+    /**
+     * Which request fields changed, so the 422 can name them. Only the hash of the original request
+     * is stored, but the original response carries {@code amount}, {@code currency} and
+     * {@code externalReference}, and {@code merchantId} is equal by construction - the key is
+     * scoped per merchant. The one hashed field the response never contains is the card token, so
+     * if nothing visible differs, the token is what changed. It is named, never echoed.
+     */
+    private static List<String> differingFields(
+            PaymentResponse original, Money amount, String externalReference) {
+        List<String> fields = new ArrayList<>();
+        if (original.amount() != amount.minorUnits()) {
+            fields.add("amount");
+        }
+        if (!original.currency().equals(amount.currencyCode())) {
+            fields.add("currency");
+        }
+        if (!Objects.equals(original.externalReference(), externalReference)) {
+            fields.add("externalReference");
+        }
+        if (fields.isEmpty()) {
+            fields.add("paymentMethodToken");
+        }
+        return fields;
     }
 
     /**

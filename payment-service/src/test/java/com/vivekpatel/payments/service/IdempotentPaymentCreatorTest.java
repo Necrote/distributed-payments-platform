@@ -62,15 +62,56 @@ class IdempotentPaymentCreatorTest {
     }
 
     @Test
-    void duplicateKeyWithADifferentRequestIsRefusedNotReplayed() {
-        IdempotencyKey stored = storedKey(
-                PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", "ref"), payment());
+    void duplicateKeyWithADifferentAmountIsRefusedAndNamesTheField() {
+        Payment original = payment();
+        storedFor(original);
         Money different = Money.of(999, "INR");
         when(service.create("m-1", different, "tok", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
-        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
 
         assertThatThrownBy(() -> creator.create("m-1", different, "tok", "ref", KEY))
-                .isInstanceOf(IdempotencyKeyReusedException.class);
+                .isInstanceOfSatisfying(IdempotencyKeyReusedException.class, e -> {
+                    assertThat(e.getOriginalPaymentId()).isEqualTo(original.getId());
+                    assertThat(e.getDifferingFields()).containsExactly("amount");
+                });
+    }
+
+    @Test
+    void everyVisibleDifferenceIsNamed() {
+        storedFor(payment());
+        Money different = Money.of(999, "USD");
+        when(service.create("m-1", different, "tok", "other-ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
+
+        assertThatThrownBy(() -> creator.create("m-1", different, "tok", "other-ref", KEY))
+                .isInstanceOfSatisfying(IdempotencyKeyReusedException.class, e ->
+                        assertThat(e.getDifferingFields())
+                                .containsExactly("amount", "currency", "externalReference"));
+    }
+
+    @Test
+    void aChangedCardTokenIsNamedByEliminationNeverEchoed() {
+        // The stored response has no token in it, so a token-only change is invisible field by
+        // field - but the hash still differs, and the token is the only hashed field left.
+        storedFor(payment());
+        when(service.create("m-1", AMOUNT, "tok-other", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok-other", "ref", KEY))
+                .isInstanceOfSatisfying(IdempotencyKeyReusedException.class, e -> {
+                    assertThat(e.getDifferingFields()).containsExactly("paymentMethodToken");
+                    assertThat(e.getMessage()).doesNotContain("tok-other");
+                });
+    }
+
+    @Test
+    void externalReferenceAddedWhereTheOriginalHadNoneIsADifference() {
+        Payment original = Payment.create("m-1", AMOUNT, "tok", null, FIXED);
+        IdempotencyKey stored = storedKey(
+                PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", null), original);
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(IdempotencyKeyReusedException.class, e ->
+                        assertThat(e.getDifferingFields()).containsExactly("externalReference"));
     }
 
     @Test
@@ -93,6 +134,13 @@ class IdempotentPaymentCreatorTest {
 
     private static Payment payment() {
         return Payment.create("m-1", AMOUNT, "tok", "ref", FIXED);
+    }
+
+    /** Stubs the lookup with the key row the original "m-1 / 12500 INR / tok / ref" call stored. */
+    private void storedFor(Payment original) {
+        IdempotencyKey stored = storedKey(
+                PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", "ref"), original);
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
     }
 
     private IdempotencyKey storedKey(String requestHash, Payment payment) {
