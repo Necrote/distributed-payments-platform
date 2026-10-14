@@ -1,5 +1,6 @@
 package com.vivekpatel.payments.api;
 
+import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
@@ -22,12 +23,14 @@ import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.domain.PaymentStatus;
 import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.service.CreatePaymentResult;
+import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.IdempotentPaymentCreator;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -195,6 +198,31 @@ class PaymentControllerTest {
                         .content(VALID_BODY))
                 .andExpect(status().isCreated());
         verify(paymentCreator).create(any(), any(), any(), any(), eq("key-7f3a"));
+    }
+
+    @Test
+    void reusedKeyWithADifferentBodyIs422ThatTellsTheClientWhatToFix() throws Exception {
+        UUID original = UUID.randomUUID();
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new IdempotencyKeyReusedException("key-7f3a", original, List.of("amount")));
+
+        mockMvc.perform(post("/payments")
+                        .header("Idempotency-Key", "key-7f3a")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_BODY))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.status").value(422))
+                .andExpect(jsonPath("$.title").value("Idempotency-Key reused with a different request"))
+                .andExpect(jsonPath("$.detail").value(
+                        "Idempotency-Key 'key-7f3a' was already used for payment " + original
+                                + " with a different request body. Differing fields: amount. To retry "
+                                + "that payment, resend its original body unchanged. To create a new "
+                                + "payment, use a new Idempotency-Key."))
+                .andExpect(jsonPath("$.idempotencyKey").value("key-7f3a"))
+                .andExpect(jsonPath("$.originalPaymentId").value(original.toString()))
+                .andExpect(jsonPath("$.differingFields", contains("amount")))
+                .andExpect(jsonPath("$.instance").value("/payments"));
     }
 
     @Test

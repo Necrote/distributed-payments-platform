@@ -61,14 +61,14 @@ public class PaymentController {
 
     /**
      * Create a payment. The {@code Idempotency-Key} header is optional until Phase 2 makes it
-     * required - see ADR-004.
+     * required - see ADR-004 ({@code docs/adr/0004-idempotency-keys.md}).
      *
      * <ul>
      *   <li>{@code 201 Created} with a {@code Location} header for a new payment;</li>
      *   <li>{@code 200 OK} with the original body when the same key and the same payload arrive
      *       again - 200, not 201, because this call created nothing;</li>
-     *   <li>TODO Phase 2 (Day 9): {@code 422 Unprocessable Entity} when the same key arrives with a
-     *       different payload. Detected and refused today, but reported as a 500.</li>
+     *   <li>{@code 422 Unprocessable Entity} when the same key arrives with a different payload.
+     *       Never a silent replay: that would report success for an amount nobody charged.</li>
      * </ul>
      */
     @PostMapping
@@ -81,6 +81,13 @@ public class PaymentController {
     @ApiResponse(
             responseCode = "400",
             description = "Invalid request; the `errors` property names each offending field",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @ApiResponse(
+            responseCode = "422",
+            description = "Idempotency-Key already used with a different body; names the original "
+                    + "payment and the `differingFields`",
             content = @Content(
                     mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
                     schema = @Schema(implementation = ProblemDetail.class)))

@@ -1,6 +1,8 @@
 package com.vivekpatel.payments.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
@@ -14,7 +16,6 @@ import com.vivekpatel.payments.domain.PaymentStatus;
 import com.vivekpatel.payments.persistence.PaymentRepository;
 import java.util.Map;
 import java.util.UUID;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.skyscreamer.jsonassert.JSONAssert;
 import org.skyscreamer.jsonassert.JSONCompareMode;
@@ -261,11 +262,74 @@ class PaymentControllerIT {
     }
 
     @Test
-    @Disabled("TODO Phase 2 (Day 9)")
     void sameIdempotencyKeyWithDifferentPayloadIsRejected() throws Exception {
-        // TODO Phase 2 (Day 9): same key, amount changed from 12500 to 999 -> expect 422 and a
-        //   ProblemDetail explaining the conflict. Silently returning the first payment here would
-        //   be the single most dangerous bug this service could ship.
+        // Silently returning the first payment here would be the single most dangerous bug this
+        // service could ship: the client would record 999 as charged; we charged 12500.
+        String merchant = "merchant-" + UUID.randomUUID();
+        String original = VALID_BODY.replace("merchant-123", merchant);
+        String key = "key-" + UUID.randomUUID();
+        String firstBody =
+                mockMvc.perform(post("/payments")
+                                .header("Idempotency-Key", key)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(original))
+                        .andExpect(status().isCreated())
+                        .andReturn().getResponse().getContentAsString();
+        String id = JsonPath.read(firstBody, "$.id");
+
+        String problem =
+                mockMvc.perform(post("/payments")
+                                .header("Idempotency-Key", key)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(original.replace("12500", "999")))
+                        .andExpect(status().isUnprocessableEntity())
+                        .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                        .andExpect(jsonPath("$.title").value("Idempotency-Key reused with a different request"))
+                        .andExpect(jsonPath("$.detail").value(containsString("already used for payment " + id)))
+                        .andExpect(jsonPath("$.detail").value(containsString("Differing fields: amount.")))
+                        .andExpect(jsonPath("$.originalPaymentId").value(id))
+                        .andExpect(jsonPath("$.differingFields", contains("amount")))
+                        .andReturn().getResponse().getContentAsString();
+        // Field names, never values: neither amount appears in the error. The random ids are
+        // removed first, or a UUID that happens to contain "999" would fail this by chance.
+        assertThat(problem.replace(id, "").replace(key, ""))
+                .doesNotContain("999")
+                .doesNotContain("12500");
+
+        assertThat(jdbc.queryForObject(
+                        "SELECT count(*) FROM payments WHERE merchant_id = ?", Long.class, merchant))
+                .isOne();
+        assertThat(jdbc.queryForObject(
+                        "SELECT amount_minor FROM payments WHERE merchant_id = ?", Long.class, merchant))
+                .isEqualTo(12500L);
+    }
+
+    @Test
+    void sameRequestWithFieldsReorderedAndRespacedIsAReplayNotA422() throws Exception {
+        // The pitfall: hash instability. A client library that serialises its map in a different
+        // order on the retry has sent the same request, and must get the replay.
+        String key = "key-" + UUID.randomUUID();
+        String reordered =
+                """
+                {"externalReference":"order-827361",   "paymentMethodToken":"tok_test_123",
+                    "currency":"INR","amount":12500,
+                 "merchantId":"merchant-123"}
+                """;
+        String id = JsonPath.read(
+                mockMvc.perform(post("/payments")
+                                .header("Idempotency-Key", key)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(VALID_BODY))
+                        .andExpect(status().isCreated())
+                        .andReturn().getResponse().getContentAsString(),
+                "$.id");
+
+        mockMvc.perform(post("/payments")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(reordered))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(id));
     }
 
     private UUID createPayment() throws Exception {

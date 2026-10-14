@@ -2,6 +2,7 @@ package com.vivekpatel.payments.api;
 
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.vivekpatel.payments.domain.IllegalStateTransitionException;
+import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.Comparator;
@@ -115,6 +116,30 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
                 "Payment is " + ex.getFrom() + " and cannot move to " + ex.getTo());
         body.setTitle("Illegal payment state transition");
         body.setProperty("currentStatus", ex.getFrom());
+        return body;
+    }
+
+    /**
+     * Same {@code Idempotency-Key}, different body. 422, not 409: nothing about the server's state
+     * would make this request succeed later - the request itself is wrong for this key.
+     *
+     * <p>Written for the client developer reading it in their logs: it says what happened, which
+     * payment the key already belongs to, which fields differ, and the two ways out. Field names
+     * only, never values - the same rule as validation errors.
+     */
+    @ExceptionHandler(IdempotencyKeyReusedException.class)
+    public ProblemDetail handleIdempotencyKeyReused(IdempotencyKeyReusedException ex) {
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.UNPROCESSABLE_ENTITY,
+                "Idempotency-Key '" + ex.getIdempotencyKey() + "' was already used for payment "
+                        + ex.getOriginalPaymentId() + " with a different request body. Differing "
+                        + "fields: " + String.join(", ", ex.getDifferingFields()) + ". "
+                        + "To retry that payment, resend its original body unchanged. "
+                        + "To create a new payment, use a new Idempotency-Key.");
+        body.setTitle("Idempotency-Key reused with a different request");
+        body.setProperty("idempotencyKey", ex.getIdempotencyKey());
+        body.setProperty("originalPaymentId", ex.getOriginalPaymentId());
+        body.setProperty("differingFields", ex.getDifferingFields());
         return body;
     }
 
