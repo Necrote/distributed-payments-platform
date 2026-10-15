@@ -7,9 +7,10 @@ Java 21 · Spring Boot 3 · PostgreSQL · Kafka · Redis · Kubernetes · Resili
 
 [![ci](https://github.com/Necrote/distributed-payments-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Necrote/distributed-payments-platform/actions/workflows/ci.yml)
 
-> **Status: Phase 1 in progress.** `payment-service` runs end to end in Docker: create, fetch,
+> **Status: Phase 2 in progress.** `payment-service` runs end to end in Docker: create, fetch,
 > capture and refund through an enforced state machine, on PostgreSQL, tested in CI against a real
-> PostgreSQL. Idempotency, the processor integration, Kafka and the ledger are **not built yet**.
+> PostgreSQL. `POST /payments` is idempotent: a retry replays, a reused key with a different body
+> is a `422`. The processor integration, Kafka and the ledger are **not built yet**.
 > The rest of this README describes the target design; [the roadmap](#roadmap-and-honest-status)
 > says exactly which parts are real today.
 
@@ -57,7 +58,29 @@ Location: http://localhost:8080/payments/e440f939-9c4b-40ea-bdc6-8372845dea64
 {"id":"e440f939-...","merchantId":"merchant-123","amount":12500,"currency":"INR","status":"CREATED",...}
 ```
 
-Then try the things that should fail, and see how they fail:
+Send the exact same request again: `200`, the same payment, `Idempotent-Replayed: true`, and no
+second row. Now reuse the key with a different amount:
+
+```bash
+curl -i -X POST http://localhost:8080/payments \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: order-827361' \
+  -d '{"merchantId":"merchant-123","amount":999,"currency":"INR","paymentMethodToken":"tok_test_123","externalReference":"order-827361"}'
+```
+
+```http
+HTTP/1.1 422
+Content-Type: application/problem+json
+
+{"type":"about:blank","title":"Idempotency-Key reused with a different request","status":422,
+ "detail":"Idempotency-Key 'order-827361' was already used for payment e440f939-... with a different
+  request body. Differing fields: amount. To retry that payment, resend its original body unchanged.
+  To create a new payment, use a new Idempotency-Key.",
+ "instance":"/payments","idempotencyKey":"order-827361","originalPaymentId":"e440f939-...",
+ "differingFields":["amount"]}
+```
+
+Then try the other things that should fail, and see how they fail:
 
 ```bash
 curl http://localhost:8080/payments/<id>                     # 200, the payment
@@ -119,6 +142,41 @@ flowchart LR
 - **Money is a `long` of minor currency units plus a currency code.** `12500 INR` is ₹125.00. There
   is no floating point anywhere near an amount.
 
+## Idempotency
+
+`POST /payments` takes an `Idempotency-Key` header, scoped per merchant. The full reasoning, and
+what it makes hard, is in [ADR-004](docs/adr/0004-idempotency-keys.md).
+
+| Same key, and… | Response | Writes |
+|---|---|---|
+| first time seen | `201 Created`, `Location` | one payment, one key row, one transaction |
+| same request again | `200 OK`, the **original** body, byte-identical, `Idempotent-Replayed: true` | nothing |
+| same request, first still in flight | waits on the unique index, then `200` (first committed) or `201` (first rolled back) | at most one payment either way |
+| **different** request | `422`, naming the original payment and the differing fields | nothing |
+
+**How "same request" is decided.** The request is fingerprinted as the SHA-256 of its *parsed* body,
+serialised with keys sorted at every level and no whitespace. A client that sends the same fields in
+a different order, or with different spacing, has sent the same request and gets the replay.
+Changing any value, including the card token, is a different request.
+
+**Why a different body is a `422` and never a replay.** Suppose the key first charged ₹125.00 and is
+reused for ₹9,999.00. A replay would answer `200`, and the client would record ₹9,999 as charged
+while we charged ₹125. A silent success is the expensive failure. It surfaces weeks later in
+reconciliation, far from its cause. The `422` fails at the bug, and its message is written so the
+client developer can fix their own code without contacting us: which payment the key belongs to,
+which fields changed (names only, never values), and the two ways out.
+
+**Why the database decides.** The key row is inserted in the same transaction as the payment, under
+`UNIQUE (merchant_id, idempotency_key)`. A concurrent retry blocks on that index rather than racing
+past a check. The duplicate-key violation is caught *after* that transaction has rolled back, and
+the stored response is read in a fresh one. A rolled-back transaction can't serve the follow-up
+read (see ADR-004).
+
+Evidence: `PaymentControllerIT` (replay, `422` with no second payment, reordered body still
+replays); `PaymentApplicationServiceIT` (a retry held behind an open transaction, both outcomes; 8
+simultaneous requests → exactly one payment); `CanonicalRequestHashTest` (sorted, whitespace-free,
+pinned SHA-256 vector).
+
 ## Payment flow
 
 ```mermaid
@@ -153,8 +211,8 @@ sequenceDiagram
 
 | Failure | What happens                                                                     | Where it is demonstrated |
 |---|----------------------------------------------------------------------------------|---|
-| Client retries the same request | Same payment returned, no second charge                                          | *Phase 2* |
-| Same key, different payload | `422`, never a silent replay of a different amount                               | *Phase 2* |
+| Client retries the same request | Same payment returned, no second charge                                          | `PaymentControllerIT`, `PaymentApplicationServiceIT` |
+| Same key, different payload | `422`, never a silent replay of a different amount                               | `PaymentControllerIT.sameIdempotencyKeyWithDifferentPayloadIsRejected` |
 | Two concurrent captures | One wins on the optimistic-lock version, one is rejected                         | *Phase 2* |
 | Processor slow | Client-side timeout bounds the wait; bulkhead stops it consuming every thread    | *Phase 3* |
 | Processor returning 500 | Bounded retry with jitter, then the circuit breaker opens and requests fail fast | *Phase 3* |
@@ -181,14 +239,17 @@ significant amount of availability for a guarantee this domain does not need.
 - A state machine that rejects illegal transitions with `409` and names the current status.
 - Money as `long` minor units + ISO-4217 currency, validated at the API (`400`, never a `500`).
 - PostgreSQL schema owned by Flyway; Hibernate only validates it.
+- Idempotent `POST /payments`: replay with the original response, `422` for a reused key with a
+  different body, proven under concurrency against a real PostgreSQL. See [Idempotency](#idempotency).
 - Uniform RFC 7807 errors; OpenAPI/Swagger UI generated from the controllers.
 - CI on every push: unit tests and Testcontainers integration tests against a real PostgreSQL.
 - Multi-stage Docker image (JRE-only Alpine runtime, non-root user) and `docker compose up`.
 
 **Not built yet - and the gaps this leaves today**
 
-- **Idempotency.** The `Idempotency-Key` header is accepted and *ignored*. Retrying a `POST`
-  today creates a second payment. This is Phase 2, and it is the point of the project.
+- **The `Idempotency-Key` is still optional.** A `POST` without one creates a payment with no
+  replay protection, so a client that retries it gets a second payment. Making the header required
+  is next. Expired keys are not swept yet either, so they keep replaying past 24h.
 - **No processor.** Nothing moves a payment from `CREATED` to `AUTHORIZED` in the running stack,
   so capture and refund can only be reached in tests, through a temporary admin endpoint that is
   disabled by default and is deleted in Phase 3. `processor-simulator` is scaffolded; its
@@ -203,8 +264,8 @@ significant amount of availability for a guarantee this domain does not need.
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Payment lifecycle, state machine, PostgreSQL, OpenAPI, Docker | **In progress**: everything listed under *works today* |
-| 2 | Idempotency, unique constraints, optimistic locking, concurrency tests | Not started |
+| 1 | Payment lifecycle, state machine, PostgreSQL, OpenAPI, Docker | Done |
+| 2 | Idempotency, unique constraints, optimistic locking, concurrency tests | **In progress**: idempotent create done; required key, expiry sweep and concurrent captures next |
 | 3 | Processor simulator, timeouts, retry, circuit breaker, bulkhead (`v0.1`) | Scaffolded (endpoints return `501`) |
 | 4 | Kafka, transactional outbox, ledger service, idempotent consumers (`v0.2`) | Scaffolded (no runnable logic) |
 | 5 | Redis cache and idempotency acceleration, measured | Not started |
