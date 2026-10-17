@@ -12,6 +12,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -116,6 +117,26 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
                 "Payment is " + ex.getFrom() + " and cannot move to " + ex.getTo());
         body.setTitle("Illegal payment state transition");
         body.setProperty("currentStatus", ex.getFrom());
+        return body;
+    }
+
+    /**
+     * A concurrent request changed the payment between this request's read and its write - the
+     * {@code @Version} check failed at commit. 409: the request lost a race against the payment's
+     * current state. Nothing from this request was applied.
+     *
+     * <p>Not retried on the server, deliberately (see {@code PaymentApplicationService#capture}).
+     * The detail tells the client to look before retrying, because the winner has usually already
+     * done what the loser was trying to do.
+     */
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    public ProblemDetail handleConcurrentUpdate(OptimisticLockingFailureException ex) {
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.CONFLICT,
+                "The payment was changed by another request while this one was in progress, and "
+                        + "nothing from this request was applied. Fetch the payment to see its "
+                        + "current state before retrying.");
+        body.setTitle("Concurrent update");
         return body;
     }
 

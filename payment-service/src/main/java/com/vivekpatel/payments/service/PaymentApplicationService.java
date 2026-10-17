@@ -117,16 +117,30 @@ public class PaymentApplicationService {
      * <p>No {@code save()}: the entity is managed inside this transaction, so dirty checking writes
      * the change at commit, with {@code AND version = ?} on the UPDATE.
      *
+     * <p><b>Two concurrent captures.</b> Both can read {@code AUTHORIZED} and both pass the state
+     * machine, because each checks its own snapshot. The version column settles it: the first
+     * commit moves the version on, and the second UPDATE matches zero rows and fails with
+     * {@code OptimisticLockingFailureException} - mapped to 409. (If the second request only reads
+     * after the first has committed, it sees {@code CAPTURED} and the state machine rejects it
+     * instead. Also 409. Either way, exactly one capture.)
+     *
+     * <p><b>Deliberately not retried.</b> A version conflict on capture means another request
+     * already changed this payment - in practice, captured it. A retry would re-read
+     * {@code CAPTURED} and fail anyway; and once a processor call sits in here (Phase 3), a retry
+     * loop is how a loser ends up fighting a legitimate winner for a second capture. The loser gets
+     * 409 and the caller decides, usually by fetching the payment and finding it captured. Do not
+     * wrap this in {@code @Retryable}.
+     *
      * @throws PaymentNotFoundException if no payment has this id.
      * @throws com.vivekpatel.payments.domain.IllegalStateTransitionException if it is not
      *     {@code AUTHORIZED}.
+     * @throws org.springframework.dao.OptimisticLockingFailureException at commit, if a concurrent
+     *     request changed the payment after this one read it.
      */
     @Transactional
     public Payment capture(UUID paymentId) {
         // TODO Phase 3 (Day 13): call the processor's capture first and record a payment_attempts
         // row. Until then the transition is the whole operation.
-        // TODO Phase 2 (Day 10): two concurrent captures both pass the guard; @Version must make
-        // the second commit fail, and that failure needs its own 409 mapping.
         Payment payment = load(paymentId);
         payment.transitionTo(PaymentStatus.CAPTURED, clock);
         return payment;

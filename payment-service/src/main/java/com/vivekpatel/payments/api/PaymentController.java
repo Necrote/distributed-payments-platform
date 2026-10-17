@@ -136,8 +136,9 @@ public class PaymentController {
     }
 
     /**
-     * Capture an authorised payment. This is the endpoint the duplicate-capture concurrency test
-     * hammers on Day 10, so it must be safe under two simultaneous callers.
+     * Capture an authorised payment. Safe under simultaneous callers: exactly one gets 200, every
+     * other gets 409 - see {@code PaymentApplicationService#capture} for why the loser is not
+     * retried.
      */
     @PostMapping("/{paymentId}/capture")
     @Operation(summary = "Capture an authorised payment")
@@ -150,7 +151,7 @@ public class PaymentController {
                     schema = @Schema(implementation = ProblemDetail.class)))
     @ApiResponse(
             responseCode = "409",
-            description = "The payment is not AUTHORIZED",
+            description = "The payment is not AUTHORIZED, or a concurrent request changed it first",
             content = @Content(
                     mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
                     schema = @Schema(implementation = ProblemDetail.class)))
@@ -159,7 +160,6 @@ public class PaymentController {
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
         // TODO Phase 3 (Day 13): there is no processor yet, so a payment only reaches AUTHORIZED
         // through the admin-forced authorisation in AdminPaymentController.
-        // TODO Phase 2 (Day 10): optimistic locking must make the second concurrent call lose.
         return ResponseEntity.ok(PaymentResponse.from(paymentService.capture(paymentId)));
     }
 

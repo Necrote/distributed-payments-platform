@@ -37,6 +37,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.test.web.servlet.MockMvc;
 
 /**
@@ -268,6 +269,21 @@ class PaymentControllerTest {
         mockMvc.perform(post("/payments/{id}/capture", unknown))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.title").value("Payment not found"));
+    }
+
+    @Test
+    void captureThatLosesAVersionRaceIs409NotA500() throws Exception {
+        UUID id = UUID.randomUUID();
+        when(paymentService.capture(id))
+                .thenThrow(new ObjectOptimisticLockingFailureException(Payment.class, id));
+
+        mockMvc.perform(post("/payments/{id}/capture", id))
+                .andExpect(status().isConflict())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.title").value("Concurrent update"))
+                .andExpect(jsonPath("$.detail").value(containsString("Fetch the payment")))
+                // Hibernate's message names the entity class; none of it reaches the client.
+                .andExpect(content().string(not(containsString("com.vivekpatel"))));
     }
 
     @Test
