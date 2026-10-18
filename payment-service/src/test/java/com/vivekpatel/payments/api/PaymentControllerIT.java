@@ -14,8 +14,16 @@ import com.jayway.jsonpath.JsonPath;
 import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.domain.PaymentStatus;
 import com.vivekpatel.payments.persistence.PaymentRepository;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.skyscreamer.jsonassert.JSONAssert;
 import org.skyscreamer.jsonassert.JSONCompareMode;
@@ -152,6 +160,60 @@ class PaymentControllerIT {
         mockMvc.perform(post("/payments/{id}/refund", id))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.currentStatus").value("AUTHORIZED"));
+    }
+
+    /**
+     * Two simultaneous captures of one AUTHORIZED payment: exactly one 200, one 409, one capture.
+     *
+     * <p>The latch releases both threads at the same instant; nothing here sleeps to "line them
+     * up". What the latch cannot control is the interleaving after that, so the loser's 409 has
+     * two legitimate shapes: a version conflict (both read AUTHORIZED, the second commit lost) or
+     * an illegal transition (it read CAPTURED because the first had already committed). Both are
+     * accepted; the assertions are on what must always hold. The version conflict itself is
+     * forced deterministically in {@code PaymentApplicationServiceIT}.
+     *
+     * <p>Repeated 20 times: a concurrency test that passes once proves little.
+     */
+    @RepeatedTest(20)
+    void twoSimultaneousCapturesProduceExactlyOneCapture() throws Exception {
+        UUID id = createPayment();
+        mockMvc.perform(post("/admin/payments/{id}/force-authorize", id)).andExpect(status().isOk());
+
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            List<Future<MvcResult>> calls = new ArrayList<>();
+            for (int i = 0; i < 2; i++) {
+                calls.add(pool.submit(() -> {
+                    start.await();
+                    return mockMvc.perform(post("/payments/{id}/capture", id)).andReturn();
+                }));
+            }
+            start.countDown();
+
+            List<MvcResult> results = new ArrayList<>();
+            for (Future<MvcResult> call : calls) {
+                results.add(call.get(10, TimeUnit.SECONDS));
+            }
+            assertThat(results)
+                    .extracting(r -> r.getResponse().getStatus())
+                    .containsExactlyInAnyOrder(200, 409);
+            MvcResult loser = results.stream()
+                    .filter(r -> r.getResponse().getStatus() == 409)
+                    .findFirst()
+                    .orElseThrow();
+            assertThat((String) JsonPath.read(loser.getResponse().getContentAsString(), "$.title"))
+                    .isIn("Concurrent update", "Illegal payment state transition");
+        } finally {
+            pool.shutdownNow();
+        }
+
+        // Exactly one write: create = 0, force-authorize (one transaction, one UPDATE) = 1,
+        // one capture = 2. A double capture would be 3, or a lost update would hide at 2 with
+        // two 200s - which the status assertion above already rules out.
+        Payment row = payments.findById(id).orElseThrow();
+        assertThat(row.getStatus()).isEqualTo(PaymentStatus.CAPTURED);
+        assertThat(row.getVersion()).isEqualTo(2L);
     }
 
     @Test

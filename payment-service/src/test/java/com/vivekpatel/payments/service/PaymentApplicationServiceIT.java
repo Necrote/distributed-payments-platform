@@ -12,14 +12,18 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.transaction.IllegalTransactionStateException;
@@ -175,6 +179,70 @@ class PaymentApplicationServiceIT {
         assertThatThrownBy(() -> tx.executeWithoutResult(status ->
                         creator.create("m-never", AMOUNT, "tok", null, "key-" + UUID.randomUUID())))
                 .isInstanceOf(IllegalTransactionStateException.class);
+    }
+
+    /**
+     * The version check itself, made deterministic. A start latch only lines threads up at the
+     * beginning; whether both then read before either commits is luck. Here each capture runs
+     * inside a transaction that waits at a barrier AFTER the read and the in-memory transition, and
+     * BEFORE commit - so both transactions are guaranteed to hold a stale AUTHORIZED snapshot.
+     * Only the version column can stop the second write now.
+     *
+     * <p>What happens at commit: the first UPDATE ... WHERE version = 1 succeeds. The second blocks
+     * on the row lock until the first commits; PostgreSQL then re-checks its WHERE against the new
+     * row (version = 2), matches zero rows, and Hibernate turns "0 rows updated" into the
+     * exception.
+     */
+    @RepeatedTest(20)
+    void staleCaptureLosesOnTheVersionColumn() throws Exception {
+        UUID id = service.create("merchant-race", AMOUNT, "tok", null, null).getId();
+        service.forceAuthorize(id);
+
+        CyclicBarrier bothHaveRead = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            List<CompletableFuture<Payment>> captures = new ArrayList<>();
+            for (int i = 0; i < 2; i++) {
+                CompletableFuture<Payment> capture = new CompletableFuture<>();
+                captures.add(capture);
+                pool.submit(() -> complete(capture, () -> tx.execute(status -> {
+                    // Joins the template's transaction: the UPDATE is deferred to its commit.
+                    Payment captured = service.capture(id);
+                    awaitQuietly(bothHaveRead);
+                    return captured;
+                })));
+            }
+
+            int won = 0;
+            List<Throwable> lost = new ArrayList<>();
+            for (CompletableFuture<Payment> capture : captures) {
+                try {
+                    capture.get(10, TimeUnit.SECONDS);
+                    won++;
+                } catch (ExecutionException e) {
+                    lost.add(e.getCause());
+                }
+            }
+            assertThat(won).isOne();
+            assertThat(lost).singleElement().isInstanceOf(OptimisticLockingFailureException.class);
+        } finally {
+            pool.shutdownNow();
+        }
+
+        // create = 0, force-authorize = 1, the one capture that committed = 2.
+        assertThat(jdbc.queryForMap("SELECT status, version FROM payments WHERE id = ?", id))
+                .containsEntry("status", "CAPTURED")
+                .containsEntry("version", 2L);
+    }
+
+    private static void awaitQuietly(CyclicBarrier barrier) {
+        try {
+            // A timeout rather than forever: if the other thread died before the barrier, fail
+            // the test instead of hanging the build.
+            barrier.await(10, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            throw new IllegalStateException("The other capture never reached the barrier", e);
+        }
     }
 
     private long paymentCount(String merchant) {
