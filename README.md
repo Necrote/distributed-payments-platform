@@ -213,7 +213,7 @@ sequenceDiagram
 |---|----------------------------------------------------------------------------------|---|
 | Client retries the same request | Same payment returned, no second charge                                          | `PaymentControllerIT`, `PaymentApplicationServiceIT` |
 | Same key, different payload | `422`, never a silent replay of a different amount                               | `PaymentControllerIT.sameIdempotencyKeyWithDifferentPayloadIsRejected` |
-| Two concurrent captures | One wins on the optimistic-lock version, one is rejected                         | *Phase 2* |
+| Two concurrent captures | One wins on the optimistic-lock version, the other gets `409`, never retried     | `PaymentControllerIT`, `PaymentApplicationServiceIT` (20 runs each) |
 | Processor slow | Client-side timeout bounds the wait; bulkhead stops it consuming every thread    | *Phase 3* |
 | Processor returning 500 | Bounded retry with jitter, then the circuit breaker opens and requests fail fast | *Phase 3* |
 | Processor times out | Attempt recorded as `UNKNOWN`; reconciliation, never a blind retry               | *Phase 3* |
@@ -241,6 +241,8 @@ significant amount of availability for a guarantee this domain does not need.
 - PostgreSQL schema owned by Flyway; Hibernate only validates it.
 - Idempotent `POST /payments`: replay with the original response, `422` for a reused key with a
   different body, proven under concurrency against a real PostgreSQL. See [Idempotency](#idempotency).
+- Optimistic locking on the payment row: two simultaneous captures give exactly one capture, and
+  the loser gets a `409` that tells it to fetch the payment before retrying.
 - Uniform RFC 7807 errors; OpenAPI/Swagger UI generated from the controllers.
 - CI on every push: unit tests and Testcontainers integration tests against a real PostgreSQL.
 - Multi-stage Docker image (JRE-only Alpine runtime, non-root user) and `docker compose up`.
@@ -256,16 +258,16 @@ significant amount of availability for a guarantee this domain does not need.
   endpoints return `501`.
 - **No Kafka, outbox or ledger.** `GET /payments/{id}/ledger` returns `501`. `ledger-service` is a
   placeholder with no runnable logic.
-- **Concurrency is unproven.** The payment row carries a `@Version`, but no test yet races two
-  captures, and the losing request is not yet mapped to a clean `409`. Until then, "one winner"
-  is a design claim, not a demonstrated one.
+- **Concurrency is proven for capture only.** Two simultaneous captures give exactly one `200`
+  and one `409`, and the test fails if `@Version` is removed. Refund takes the same path but has
+  no race test of its own yet.
 - No auth, no Redis, no metrics dashboards, no Kubernetes, no load-test numbers. Nothing on this
   page is a performance claim.
 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Payment lifecycle, state machine, PostgreSQL, OpenAPI, Docker | Done |
-| 2 | Idempotency, unique constraints, optimistic locking, concurrency tests | **In progress**: idempotent create done; required key, expiry sweep and concurrent captures next |
+| 2 | Idempotency, unique constraints, optimistic locking, concurrency tests | **In progress**: idempotent create and concurrent capture done; required key and expiry sweep next |
 | 3 | Processor simulator, timeouts, retry, circuit breaker, bulkhead (`v0.1`) | Scaffolded (endpoints return `501`) |
 | 4 | Kafka, transactional outbox, ledger service, idempotent consumers (`v0.2`) | Scaffolded (no runnable logic) |
 | 5 | Redis cache and idempotency acceleration, measured | Not started |
