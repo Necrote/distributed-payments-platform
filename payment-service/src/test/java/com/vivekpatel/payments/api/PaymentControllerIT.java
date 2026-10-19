@@ -300,6 +300,60 @@ class PaymentControllerIT {
                 .isOne();
     }
 
+    /**
+     * The guarantee under real concurrency: 20 identical requests, one key, released at once.
+     *
+     * <p>20 is twice the connection pool (10), on purpose. The winner and up to nine losers hold a
+     * connection while they wait on the unique index; the rest wait for a connection. That only
+     * works because the winner's transaction is short - it commits, the blocked inserts fail fast
+     * and hand their connections back. If something slow ever moves inside that transaction, this
+     * is the test that times out first.
+     */
+    @Test
+    void twentySimultaneousIdenticalRequestsCreateOnePaymentAndAllCarryItsId() throws Exception {
+        int threads = 20;
+        String merchant = "merchant-" + UUID.randomUUID();
+        String body = VALID_BODY.replace("merchant-123", merchant);
+        String key = "key-" + UUID.randomUUID();
+
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        List<MvcResult> results = new ArrayList<>();
+        try {
+            List<Future<MvcResult>> calls = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                calls.add(pool.submit(() -> {
+                    start.await();
+                    return mockMvc.perform(post("/payments")
+                                    .header("Idempotency-Key", key)
+                                    .contentType(MediaType.APPLICATION_JSON)
+                                    .content(body))
+                            .andReturn();
+                }));
+            }
+            start.countDown();
+            for (Future<MvcResult> call : calls) {
+                results.add(call.get(30, TimeUnit.SECONDS));
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(results)
+                .extracting(r -> r.getResponse().getStatus())
+                .as("one creator, nineteen replays")
+                .containsOnly(201, 200)
+                .filteredOn(s -> s == 201).hasSize(1);
+        List<String> ids = new ArrayList<>();
+        for (MvcResult r : results) {
+            ids.add(JsonPath.read(r.getResponse().getContentAsString(), "$.id"));
+        }
+        assertThat(ids).hasSize(threads).containsOnly(ids.get(0));
+        assertThat(jdbc.queryForObject(
+                        "SELECT count(*) FROM payments WHERE merchant_id = ?", Long.class, merchant))
+                .isOne();
+    }
+
     @Test
     void replayReturnsTheOriginalResponseEvenAfterThePaymentHasMoved() throws Exception {
         String key = "key-" + UUID.randomUUID();
