@@ -132,6 +132,18 @@ class IdempotentPaymentCreatorTest {
         verify(service, never()).findIdempotencyKey(any(), any());
     }
 
+    @Test
+    void violationWithNoHibernateCauseIsRethrownNotAnNpe() {
+        // PIT: "t != null" in the cause-chain walk could become "true" unnoticed - every test's
+        // chain contained a Hibernate exception, so the walk never reached its end. A violation
+        // from plain JDBC, or one Spring built without a cause, must come out unchanged.
+        DataIntegrityViolationException bare = new DataIntegrityViolationException("no cause");
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(bare);
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY)).isSameAs(bare);
+        verify(service, never()).findIdempotencyKey(any(), any());
+    }
+
     private static Payment payment() {
         return Payment.create("m-1", AMOUNT, "tok", "ref", FIXED);
     }
