@@ -231,6 +231,41 @@ choice, not a defect, and the API is honest about it; the ledger endpoint can le
 "not posted yet". The alternative, a distributed transaction across both services, trades a
 significant amount of availability for a guarantee this domain does not need.
 
+## Testing
+
+`cd payment-service && mvn verify` runs both suites. Mutation testing is a separate goal:
+`mvn test-compile org.pitest:pitest-maven:mutationCoverage`.
+
+| Suite | What it covers | Runs on |
+|---|---|---|
+| Unit (`*Test`) | Domain rules, the canonical hash, the HTTP contract with the service mocked | `mvn test`, no Docker |
+| Integration (`*IT`) | Real PostgreSQL via Testcontainers: transactions, constraints, concurrency | `mvn verify`, needs Docker |
+| Mutation (PIT) | Whether the unit tests would *notice* a change to `domain` and `service` | CI job, gated |
+
+**Concurrency is tested with real threads against a real database,** never with `Thread.sleep`:
+20 identical `POST /payments` with one key, released by a latch, give exactly one row and 20
+responses carrying the same id. Two simultaneous captures give exactly one capture, run 20 times,
+plus a deterministic twin that forces the stale read.
+
+**Mutation score, measured, not chosen** (PIT 1.16, `domain` + `service`, unit tests only):
+
+| Date | Killed | Score | Test strength | Line coverage |
+|---|---|---|---|---|
+| 2026-10-19, first run | 77 / 121 | 64% | 87% | 75% |
+| 2026-10-19, after killing the weakest survivors | 91 / 121 | **75%** | 99% | 76% |
+
+- **Line coverage moved one point, and mutation score moved eleven.** The `Payment` entity's lines
+  were already *executed* by other tests, but nothing asserted on them. Deleting the state-machine
+  guard from `Payment.transitionTo` survived. So did removing the positive-amount check, and a
+  `<` → `<=` boundary in `Money` formatting that would print zero as `-0.00`. Each now has a test.
+- **The CI gate is 75**, just under the measured 75.2%. Disabling one test drops the score to 74
+  and fails the build. That was checked before trusting the gate. The gate goes up as the score
+  does.
+- **What's left:** one *equivalent* mutant (`target == null` in `PaymentStatus.canTransitionTo`,
+  which `EnumSet.contains(null)` already makes false). The other 29 unkilled mutants are in code
+  only the integration tests reach (`PaymentApplicationService`, `IdempotencyKey`). PIT doesn't run
+  Testcontainers, so that code is well tested but not mutation-tested.
+
 ## Roadmap and honest status
 
 **Works today**
@@ -244,7 +279,8 @@ significant amount of availability for a guarantee this domain does not need.
 - Optimistic locking on the payment row: two simultaneous captures give exactly one capture, and
   the loser gets a `409` that tells it to fetch the payment before retrying.
 - Uniform RFC 7807 errors; OpenAPI/Swagger UI generated from the controllers.
-- CI on every push: unit tests and Testcontainers integration tests against a real PostgreSQL.
+- CI on every push: unit tests and Testcontainers integration tests against a real PostgreSQL,
+  plus a PIT mutation-score gate set from a measured score. See [Testing](#testing).
 - Multi-stage Docker image (JRE-only Alpine runtime, non-root user) and `docker compose up`.
 
 **Not built yet - and the gaps this leaves today**

@@ -62,28 +62,29 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------------------------------
-  # Mutation testing. Enable in Phase 2 (Day 11), after you have MEASURED a score and strengthened
-  # the weak tests - then set the threshold in payment-service/pom.xml just below what you reached
-  # and let it fail the build. A threshold invented before the first measurement is theatre.
-  #
-  # Prove the gate works before you trust it: weaken an assertion on a branch and watch CI go red.
+  # Mutation testing. Enabled Day 11, after measuring: 91/121 mutants killed (75%). The threshold
+  # in payment-service/pom.xml is 75 - just under the measurement - and fails this job if the
+  # score drops. Proven locally before trusting it: disabling one test (PaymentTest's illegal-
+  # transition check) took the score to 74 and failed the build. A threshold invented before the
+  # first measurement is theatre.
   # -------------------------------------------------------------------------------------------
-  # mutation-testing:
-  #   name: PIT mutation score
-  #   runs-on: ubuntu-latest
-  #   needs: build
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions/setup-java@v4
-  #       with: { distribution: temurin, java-version: "21", cache: maven }
-  #     - name: Mutation coverage
-  #       working-directory: payment-service
-  #       run: mvn ${{ env.MAVEN_ARGS }} org.pitest:pitest-maven:mutationCoverage
-  #     - uses: actions/upload-artifact@v4
-  #       if: always()
-  #       with:
-  #         name: pit-report
-  #         path: payment-service/target/pit-reports/
+  mutation-testing:
+    name: PIT mutation score
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21", cache: maven }
+      # test-compile first: on a fresh checkout there are no classes for PIT to mutate.
+      - name: Mutation coverage
+        working-directory: payment-service
+        run: mvn ${{ env.MAVEN_ARGS }} test-compile org.pitest:pitest-maven:mutationCoverage
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pit-report
+          path: payment-service/target/pit-reports/
 
   # -------------------------------------------------------------------------------------------
   # Phase 8 (Day 60): a Gatling smoke run on every push, with a low, MEASURED assertion so it

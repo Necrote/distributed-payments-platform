@@ -136,11 +136,17 @@
         </executions>
       </plugin>
 
-      <!-- Mutation testing. Run it manually first:
+      <!-- Mutation testing:
              mvn org.pitest:pitest-maven:mutationCoverage
-           Read the survived mutants, strengthen the tests, and only then uncomment
-           <mutationThreshold> so the build fails below the number you have actually reached.
-           Setting a threshold you have never measured is how a "quality gate" becomes decoration. -->
+           The threshold below is MEASURED, not chosen. History (domain + service, unit tests only):
+             2026-10-19  first run        77/121 killed = 64%  (test strength 87%)
+             2026-10-19  after Day 11     91/121 killed = 75%  (test strength 99%)
+           The gate sits just under the last measurement. PIT compares whole percentages, so 75
+           against a measured 75.2% means losing any single kill fails the build - 74 would not
+           notice. Raise it when the score rises; never lower it to make a red build green.
+           Most of what is left unkilled is NO_COVERAGE in classes only the *IT tests exercise
+           (PaymentApplicationService, IdempotencyKey): PIT runs unit tests, not Testcontainers. -->
+
       <plugin>
         <groupId>org.pitest</groupId>
         <artifactId>pitest-maven</artifactId>
@@ -167,7 +173,7 @@
             <mutator>REMOVE_CONDITIONALS</mutator>
           </mutators>
           <timestampedReports>false</timestampedReports>
-          <!-- <mutationThreshold>80</mutationThreshold> -->
+          <mutationThreshold>75</mutationThreshold>
           <!-- <failWhenNoMutations>true</failWhenNoMutations> -->
         </configuration>
       </plugin>
