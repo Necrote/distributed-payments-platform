@@ -9,10 +9,10 @@ import java.util.Set;
 /**
  * The payment lifecycle, expressed as an explicit state machine.
  *
- * <p>This enum is deliberately the most complete piece of code in the starter scaffold, because it
- * is the spine of the whole service: every write path in {@code PaymentService} must ask this class
- * whether a transition is legal before it touches the database. Nothing else in the codebase is
- * allowed to set a status directly.
+ * <p>This enum is the spine of the whole service: every status change goes through
+ * {@code Payment.transitionTo}, which asks this class whether the move is legal before anything
+ * reaches the database. Nothing else in the codebase is allowed to set a status directly. The
+ * reasoning, and what it makes hard, is in ADR-006 ({@code docs/adr/0006-payment-state-machine.md}).
  *
  * <p><b>Why a map instead of {@code if} statements?</b> Because the legal transitions are data, and
  * data can be tested exhaustively. {@code PaymentStatusTest} walks every ordered pair of states
