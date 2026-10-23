@@ -144,8 +144,28 @@ flowchart LR
 
 ## Idempotency
 
-`POST /payments` takes an `Idempotency-Key` header, scoped per merchant. The full reasoning, and
-what it makes hard, is in [ADR-004](docs/adr/0004-idempotency-keys.md).
+A client whose `POST /payments` times out can't tell whether the payment was created. Its only safe
+move is to retry, sometimes while the first attempt is still running. So the client sends an
+`Idempotency-Key` header (scoped per merchant), and the service guarantees **three properties**:
+
+1. **A retry never creates a second payment**, even when it arrives while the first is in flight.
+2. **A retry gets the original answer**: the first response, byte for byte, not the payment's
+   current state.
+3. **A reused key with a different request is rejected** with a `422`, never answered with the
+   first payment.
+
+**How it works, in four steps:**
+
+1. Fingerprint the request: SHA-256 of the parsed body, keys sorted, no whitespace.
+2. In **one** database transaction: insert a row into `idempotency_keys` under
+   `UNIQUE (merchant_id, idempotency_key)`, insert the payment, and store the response on the key
+   row.
+3. If the insert hits that unique constraint, the key was already used. That transaction is now
+   dead, so recovery happens *after* it rolls back: read the stored row in a fresh transaction.
+4. Same fingerprint → replay the stored response with `200`. Different fingerprint → `422`.
+
+The full reasoning, the alternatives rejected, and what this makes hard are in
+[ADR-004](docs/adr/0004-idempotency-keys.md).
 
 | Same key, and… | Response | Writes |
 |---|---|---|
@@ -166,16 +186,32 @@ reconciliation, far from its cause. The `422` fails at the bug, and its message 
 client developer can fix their own code without contacting us: which payment the key belongs to,
 which fields changed (names only, never values), and the two ways out.
 
-**Why the database decides.** The key row is inserted in the same transaction as the payment, under
-`UNIQUE (merchant_id, idempotency_key)`. A concurrent retry blocks on that index rather than racing
-past a check. The duplicate-key violation is caught *after* that transaction has rolled back, and
-the stored response is read in a fresh one. A rolled-back transaction can't serve the follow-up
-read (see ADR-004).
+**Why the database decides, and not a check in code or a cache.** "Look for the key, insert it if
+absent" has a gap that two simultaneous requests can both fit through. The unique constraint has no
+gap: a concurrent retry *waits* on the index until the first transaction ends. Then it either finds
+the key (the first committed, so it replays) or doesn't (the first rolled back, so it creates). Redis
+isn't the safeguard either. It isn't in the payment's transaction, a failover can lose a key it had
+acknowledged, and `allkeys-lru` eviction can delete one under memory pressure. Each of those makes
+a retry look new, which is a second charge. Redis may later make the lookup *faster*; the constraint
+stays what makes it *true*.
 
-Evidence: `PaymentControllerIT` (replay, `422` with no second payment, reordered body still
-replays); `PaymentApplicationServiceIT` (a retry held behind an open transaction, both outcomes; 8
-simultaneous requests → exactly one payment); `CanonicalRequestHashTest` (sorted, whitespace-free,
-pinned SHA-256 vector).
+**Why the recovery runs outside the transaction.** Once the duplicate-key error fires, PostgreSQL
+refuses every further statement in that transaction. Catching the error inside it and reading the
+stored row there fails, and it fails three different ways, all reproduced. So the catch lives a
+layer up, and the read gets a transaction of its own.
+
+### The evidence
+
+Each property is tested against a real PostgreSQL (Testcontainers), with real threads:
+
+| Property | Test | What it shows |
+|---|---|---|
+| 1. No second payment, under concurrency | `PaymentControllerIT` (20 threads) | 20 identical requests released together by a latch: **one `201`, nineteen `200`s, 20 identical ids, one row**. 20 is twice the connection pool, on purpose. |
+| 1. …including mid-flight | `PaymentApplicationServiceIT` | The first transaction is held open, and `pg_stat_activity` confirms the retry is *waiting on the lock*. Commit → the retry replays. Roll back → the retry creates. One row either way. |
+| 1. Key and payment are atomic | `PaymentApplicationServiceIT` | The key row is flushed, then the payment insert fails: afterwards, **no key row and no payment**. |
+| 2. The original answer | `PaymentControllerIT` | The second response *string-equals* the first. After the payment is authorised, a replay still says `CREATED`. |
+| 3. Different body → 422 | `PaymentControllerIT` | 12500 then 999 with one key → `422`, still exactly one payment, at 12500. Neither amount appears in the error. |
+| "Same request" is semantic | `PaymentControllerIT`, `CanonicalRequestHashTest` | A reordered, re-spaced body replays (`200`, not `422`). The hash is pinned to a SHA-256 vector computed independently. |
 
 ## Payment flow
 
@@ -271,7 +307,8 @@ plus a deterministic twin that forces the stale read.
 **Works today**
 
 - `POST /payments`, `GET /payments/{id}`, `POST /payments/{id}/capture`, `POST /payments/{id}/refund`.
-- A state machine that rejects illegal transitions with `409` and names the current status.
+- A state machine that rejects illegal transitions with `409` and names the current status, all 49
+  state pairs tested. See [ADR-006](docs/adr/0006-payment-state-machine.md).
 - Money as `long` minor units + ISO-4217 currency, validated at the API (`400`, never a `500`).
 - PostgreSQL schema owned by Flyway; Hibernate only validates it.
 - Idempotent `POST /payments`: replay with the original response, `422` for a reused key with a
@@ -299,6 +336,15 @@ plus a deterministic twin that forces the stale read.
   no race test of its own yet.
 - No auth, no Redis, no metrics dashboards, no Kubernetes, no load-test numbers. Nothing on this
   page is a performance claim.
+
+**Deliberately out of scope - known limitations, not oversights**
+
+- **Full refunds only.** No partial refunds: a second refund of the same payment would be a double
+  reversal, and the schema enforces one active refund per payment.
+- **No disputes or chargebacks, and no authorisation expiry.** Each is a lifecycle of its own. The
+  seven-state machine is enough to show the pattern, and why it stops there is in
+  [ADR-006](docs/adr/0006-payment-state-machine.md).
+- **Single currency per payment, with fixed minor-unit exponents** (INR/USD 2, JPY 0). No FX.
 
 | Phase | Scope | Status |
 |---|---|---|
