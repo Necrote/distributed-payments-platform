@@ -1,11 +1,20 @@
 package com.vivekpatel.payments.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.vivekpatel.payments.api.dto.PaymentResponse;
+import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.domain.PaymentStatus;
+import com.vivekpatel.payments.persistence.IdempotencyKeyRepository;
 import com.vivekpatel.payments.persistence.PaymentRepository;
 import java.time.Clock;
+import java.time.Duration;
+import java.util.Optional;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -13,28 +22,80 @@ import org.springframework.transaction.annotation.Transactional;
  * Use cases for the payment aggregate. Each public method is one transaction.
  *
  * <p>Takes domain types rather than API DTOs, so this layer does not depend on the HTTP contract.
- *
- * <p>No idempotency here yet. That arrives in Phase 2 as a key claim inside this same transaction.
- * A half-built check would look finished without being safe, so there is deliberately none.
+ * The one exception is {@link PaymentResponse}: the idempotency row stores the response a retry
+ * replays, and that body has to come from the same DTO the controller returns, or a replay would
+ * differ from the original.
  */
 @Service
 public class PaymentApplicationService {
 
     private final PaymentRepository payments;
+    private final IdempotencyKeyRepository idempotencyKeys;
+    private final ObjectMapper objectMapper;
     private final Clock clock;
+    private final Duration keyTtl;
 
-    public PaymentApplicationService(PaymentRepository payments, Clock clock) {
+    public PaymentApplicationService(
+            PaymentRepository payments,
+            IdempotencyKeyRepository idempotencyKeys,
+            ObjectMapper objectMapper,
+            Clock clock,
+            @Value("${payments.idempotency.key-ttl}") Duration keyTtl) {
         this.payments = payments;
+        this.idempotencyKeys = idempotencyKeys;
+        this.objectMapper = objectMapper;
         this.clock = clock;
+        this.keyTtl = keyTtl;
     }
 
-    /** Persists a new payment in {@code CREATED} and returns the saved aggregate. */
+    /**
+     * Persists a new payment in {@code CREATED} and returns the saved aggregate.
+     *
+     * <p>With an {@code idempotencyKey}, the same transaction also inserts the key row and records
+     * the response a retry should get. Without one, only the payment is written.
+     *
+     * <p>A key that already exists fails here with a {@code DataIntegrityViolationException}, and
+     * this transaction rolls back. Turning that into a replay is {@link IdempotentPaymentCreator}'s
+     * job, outside this transaction - see there for why it cannot be done in here.
+     */
     @Transactional
     public Payment create(
-            String merchantId, Money amount, String paymentMethodToken, String externalReference) {
-        Payment payment =
-                Payment.create(merchantId, amount, paymentMethodToken, externalReference, clock);
-        return payments.save(payment);
+            String merchantId,
+            Money amount,
+            String paymentMethodToken,
+            String externalReference,
+            String idempotencyKey) {
+        // ONE transaction, on purpose. "Reserve the key, commit, then create the payment" looks
+        // safer and reopens the exact race the UNIQUE constraint exists to close. Between the two
+        // commits the key exists with no payment behind it. A retry that lands in that gap cannot
+        // tell "still in progress" from "crashed after reserving", and if the first request did
+        // crash, the key is stuck with nothing to replay. The only way out is to let a retry take
+        // over a key with no payment - and when the first request was merely slow, not dead, both
+        // now create a payment. Two charges, one key.
+        //
+        // Here the key row and the payment commit together or not at all, so a key with no
+        // payment is never visible to anyone. A concurrent request with the same key blocks on
+        // the unique index until this transaction ends, then gets the duplicate-key violation:
+        // the database, not an application-level check, decides who won.
+        IdempotencyKey claim = null;
+        if (idempotencyKey != null) {
+            String requestHash =
+                    requestHash(merchantId, amount, paymentMethodToken, externalReference);
+            // Flushed now, not at commit, so a duplicate fails here before any payment is written.
+            claim = idempotencyKeys.saveAndFlush(
+                    IdempotencyKey.claim(merchantId, idempotencyKey, requestHash, keyTtl, clock));
+        }
+
+        Payment payment = payments.save(
+                Payment.create(merchantId, amount, paymentMethodToken, externalReference, clock));
+
+        if (claim != null) {
+            // Managed entity: dirty checking issues the UPDATE at commit, after the payment INSERT
+            // that the payment_id foreign key needs.
+            claim.recordResponse(
+                    payment.getId(), HttpStatus.CREATED.value(), responseBody(payment));
+        }
+        return payment;
     }
 
     /**
@@ -56,16 +117,30 @@ public class PaymentApplicationService {
      * <p>No {@code save()}: the entity is managed inside this transaction, so dirty checking writes
      * the change at commit, with {@code AND version = ?} on the UPDATE.
      *
+     * <p><b>Two concurrent captures.</b> Both can read {@code AUTHORIZED} and both pass the state
+     * machine, because each checks its own snapshot. The version column settles it: the first
+     * commit moves the version on, and the second UPDATE matches zero rows and fails with
+     * {@code OptimisticLockingFailureException} - mapped to 409. (If the second request only reads
+     * after the first has committed, it sees {@code CAPTURED} and the state machine rejects it
+     * instead. Also 409. Either way, exactly one capture.)
+     *
+     * <p><b>Deliberately not retried.</b> A version conflict on capture means another request
+     * already changed this payment - in practice, captured it. A retry would re-read
+     * {@code CAPTURED} and fail anyway; and once a processor call sits in here (Phase 3), a retry
+     * loop is how a loser ends up fighting a legitimate winner for a second capture. The loser gets
+     * 409 and the caller decides, usually by fetching the payment and finding it captured. Do not
+     * wrap this in {@code @Retryable}.
+     *
      * @throws PaymentNotFoundException if no payment has this id.
      * @throws com.vivekpatel.payments.domain.IllegalStateTransitionException if it is not
      *     {@code AUTHORIZED}.
+     * @throws org.springframework.dao.OptimisticLockingFailureException at commit, if a concurrent
+     *     request changed the payment after this one read it.
      */
     @Transactional
     public Payment capture(UUID paymentId) {
         // TODO Phase 3 (Day 13): call the processor's capture first and record a payment_attempts
         // row. Until then the transition is the whole operation.
-        // TODO Phase 2 (Day 10): two concurrent captures both pass the guard; @Version must make
-        // the second commit fail, and that failure needs its own 409 mapping.
         Payment payment = load(paymentId);
         payment.transitionTo(PaymentStatus.CAPTURED, clock);
         return payment;
@@ -104,7 +179,56 @@ public class PaymentApplicationService {
         return payment;
     }
 
+    /**
+     * The stored idempotency row for this merchant and key, in its own read-only transaction.
+     *
+     * <p>Called after a create has failed on the duplicate key, so the transaction that failed is
+     * already gone. A fresh transaction under READ COMMITTED takes a fresh snapshot, which is what
+     * makes the winner's just-committed row visible here.
+     */
+    @Transactional(readOnly = true)
+    public Optional<IdempotencyKey> findIdempotencyKey(String merchantId, String idempotencyKey) {
+        return idempotencyKeys.findByMerchantIdAndIdempotencyKey(merchantId, idempotencyKey);
+    }
+
+    /** SHA-256 of the canonical create request; the value stored in {@code request_hash}. */
+    static String requestHash(
+            String merchantId, Money amount, String paymentMethodToken, String externalReference) {
+        return CanonicalRequestHash.of(new CreatePaymentFingerprint(
+                merchantId,
+                amount.minorUnits(),
+                amount.currencyCode(),
+                paymentMethodToken,
+                externalReference));
+    }
+
     private Payment load(UUID paymentId) {
         return payments.findById(paymentId).orElseThrow(() -> new PaymentNotFoundException(paymentId));
+    }
+
+    /**
+     * Serialised with the same {@code ObjectMapper} Spring MVC uses for responses, so the stored
+     * body matches what the client received on the first call.
+     */
+    private String responseBody(Payment payment) {
+        try {
+            return objectMapper.writeValueAsString(PaymentResponse.from(payment));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("PaymentResponse could not be serialised", e);
+        }
+    }
+
+    /**
+     * What a create request means, for hashing. Field names match the {@code POST /payments} JSON,
+     * and the values are the parsed ones, so whitespace and key order in the client's body never
+     * reach the hash. {@code externalReference} is included even when null: omitting it and
+     * sending {@code null} are the same request.
+     */
+    private record CreatePaymentFingerprint(
+            String merchantId,
+            long amount,
+            String currency,
+            String paymentMethodToken,
+            String externalReference) {
     }
 }

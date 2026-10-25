@@ -4,6 +4,8 @@ import com.vivekpatel.payments.api.dto.CreatePaymentRequest;
 import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.service.CreatePaymentResult;
+import com.vivekpatel.payments.service.IdempotentPaymentCreator;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
@@ -45,32 +47,47 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 @Tag(name = "Payments", description = "Create, inspect, capture and refund payments")
 public class PaymentController {
 
+    static final String REPLAYED_HEADER = "Idempotent-Replayed";
+
     // Constructor injection, not @Autowired on a field: it makes the dependency visible in the test.
     private final PaymentApplicationService paymentService;
+    private final IdempotentPaymentCreator paymentCreator;
 
-    public PaymentController(PaymentApplicationService paymentService) {
+    public PaymentController(
+            PaymentApplicationService paymentService, IdempotentPaymentCreator paymentCreator) {
         this.paymentService = paymentService;
+        this.paymentCreator = paymentCreator;
     }
 
     /**
-     * Create a payment. The {@code Idempotency-Key} header is accepted from day one but is only
-     * enforced in Phase 2 - see ADR-004.
-     *
-     * <p>Target behaviour once implemented:
+     * Create a payment. The {@code Idempotency-Key} header is optional until Phase 2 makes it
+     * required - see ADR-004 ({@code docs/adr/0004-idempotency-keys.md}).
      *
      * <ul>
      *   <li>{@code 201 Created} with a {@code Location} header for a new payment;</li>
      *   <li>{@code 200 OK} with the original body when the same key and the same payload arrive
-     *       again;</li>
-     *   <li>{@code 422 Unprocessable Entity} when the same key arrives with a different payload.</li>
+     *       again - 200, not 201, because this call created nothing;</li>
+     *   <li>{@code 422 Unprocessable Entity} when the same key arrives with a different payload.
+     *       Never a silent replay: that would report success for an amount nobody charged.</li>
      * </ul>
      */
     @PostMapping
-    @Operation(summary = "Create a payment (idempotent from Phase 2)")
+    @Operation(summary = "Create a payment (idempotent with an Idempotency-Key)")
     @ApiResponse(responseCode = "201", description = "Created; Location header points at the payment")
+    @ApiResponse(
+            responseCode = "200",
+            description = "Replay: this key and payload already created a payment; its original body. "
+                    + "Carries `" + REPLAYED_HEADER + ": true`")
     @ApiResponse(
             responseCode = "400",
             description = "Invalid request; the `errors` property names each offending field",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @ApiResponse(
+            responseCode = "422",
+            description = "Idempotency-Key already used with a different body; names the original "
+                    + "payment and the `differingFields`",
             content = @Content(
                     mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
                     schema = @Schema(implementation = ProblemDetail.class)))
@@ -79,20 +96,27 @@ public class PaymentController {
                     @RequestHeader(value = "Idempotency-Key", required = false)
                     String idempotencyKey,
             @Valid @RequestBody CreatePaymentRequest request) {
-        // TODO Phase 2 (Day 7): claim the idempotency key inside the same transaction. The header
-        // is accepted but deliberately ignored until then.
-        Payment payment =
-                paymentService.create(
+        CreatePaymentResult result =
+                paymentCreator.create(
                         request.merchantId(),
                         Money.of(request.amount(), request.currency()),
                         request.paymentMethodToken(),
-                        request.externalReference());
-        URI location =
-                ServletUriComponentsBuilder.fromCurrentRequest()
-                        .path("/{paymentId}")
-                        .buildAndExpand(payment.getId())
-                        .toUri();
-        return ResponseEntity.created(location).body(PaymentResponse.from(payment));
+                        request.externalReference(),
+                        idempotencyKey);
+        return switch (result) {
+            case CreatePaymentResult.Created(Payment payment) -> {
+                URI location =
+                        ServletUriComponentsBuilder.fromCurrentRequest()
+                                .path("/{paymentId}")
+                                .buildAndExpand(payment.getId())
+                                .toUri();
+                yield ResponseEntity.created(location).body(PaymentResponse.from(payment));
+            }
+            // The header lets a client (and whoever reads its logs) tell a replay from a fresh
+            // success without comparing ids.
+            case CreatePaymentResult.Replayed(PaymentResponse original) ->
+                    ResponseEntity.ok().header(REPLAYED_HEADER, "true").body(original);
+        };
     }
 
     /** Fetch a payment by id. Phase 5 puts a Redis read-through cache in front of this path. */
@@ -112,8 +136,9 @@ public class PaymentController {
     }
 
     /**
-     * Capture an authorised payment. This is the endpoint the duplicate-capture concurrency test
-     * hammers on Day 10, so it must be safe under two simultaneous callers.
+     * Capture an authorised payment. Safe under simultaneous callers: exactly one gets 200, every
+     * other gets 409 - see {@code PaymentApplicationService#capture} for why the loser is not
+     * retried.
      */
     @PostMapping("/{paymentId}/capture")
     @Operation(summary = "Capture an authorised payment")
@@ -126,7 +151,7 @@ public class PaymentController {
                     schema = @Schema(implementation = ProblemDetail.class)))
     @ApiResponse(
             responseCode = "409",
-            description = "The payment is not AUTHORIZED",
+            description = "The payment is not AUTHORIZED, or a concurrent request changed it first",
             content = @Content(
                     mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
                     schema = @Schema(implementation = ProblemDetail.class)))
@@ -135,7 +160,6 @@ public class PaymentController {
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
         // TODO Phase 3 (Day 13): there is no processor yet, so a payment only reaches AUTHORIZED
         // through the admin-forced authorisation in AdminPaymentController.
-        // TODO Phase 2 (Day 10): optimistic locking must make the second concurrent call lose.
         return ResponseEntity.ok(PaymentResponse.from(paymentService.capture(paymentId)));
     }
 

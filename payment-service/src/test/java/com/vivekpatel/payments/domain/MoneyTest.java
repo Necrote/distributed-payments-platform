@@ -37,6 +37,18 @@ class MoneyTest {
     }
 
     @Test
+    @DisplayName("a currency mismatch names both sides, and a null operand is a mismatch, not an NPE")
+    void mismatchMessageNamesBothCurrencies() {
+        // PIT: the message's null branch could be flipped either way unnoticed - nothing read it.
+        Money rupees = Money.of(100L, "INR");
+        assertEquals("Currency mismatch: INR vs USD",
+                assertThrows(IllegalArgumentException.class,
+                        () -> rupees.plus(Money.of(1L, "USD"))).getMessage());
+        assertEquals("Currency mismatch: INR vs null",
+                assertThrows(IllegalArgumentException.class, () -> rupees.minus(null)).getMessage());
+    }
+
+    @Test
     @DisplayName("addition and subtraction stay exact")
     void addsAndSubtracts() {
         assertEquals(Money.of(300L, "INR"), Money.of(100L, "INR").plus(Money.of(200L, "INR")));
@@ -67,5 +79,13 @@ class MoneyTest {
         assertEquals("0.50 INR", Money.of(50L, "INR").toDisplayString());
         assertEquals("-0.50 INR", Money.of(-50L, "INR").toDisplayString());
         assertEquals("1250 JPY", Money.of(1250L, "JPY").toDisplayString());
+    }
+
+    @Test
+    @DisplayName("zero is not negative: no minus sign at the boundary")
+    void formatsZeroWithoutASign() {
+        // PIT: "minorUnits < 0" -> "<= 0" survived, which would print "-0.00 INR" for zero.
+        assertEquals("0.00 INR", Money.of(0L, "INR").toDisplayString());
+        assertEquals("0 JPY", Money.of(0L, "JPY").toDisplayString());
     }
 }

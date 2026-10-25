@@ -2,6 +2,7 @@ package com.vivekpatel.payments.api;
 
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.vivekpatel.payments.domain.IllegalStateTransitionException;
+import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.Comparator;
@@ -11,6 +12,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -115,6 +117,50 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
                 "Payment is " + ex.getFrom() + " and cannot move to " + ex.getTo());
         body.setTitle("Illegal payment state transition");
         body.setProperty("currentStatus", ex.getFrom());
+        return body;
+    }
+
+    /**
+     * A concurrent request changed the payment between this request's read and its write - the
+     * {@code @Version} check failed at commit. 409: the request lost a race against the payment's
+     * current state. Nothing from this request was applied.
+     *
+     * <p>Not retried on the server, deliberately (see {@code PaymentApplicationService#capture}).
+     * The detail tells the client to look before retrying, because the winner has usually already
+     * done what the loser was trying to do.
+     */
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    public ProblemDetail handleConcurrentUpdate(OptimisticLockingFailureException ex) {
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.CONFLICT,
+                "The payment was changed by another request while this one was in progress, and "
+                        + "nothing from this request was applied. Fetch the payment to see its "
+                        + "current state before retrying.");
+        body.setTitle("Concurrent update");
+        return body;
+    }
+
+    /**
+     * Same {@code Idempotency-Key}, different body. 422, not 409: nothing about the server's state
+     * would make this request succeed later - the request itself is wrong for this key.
+     *
+     * <p>Written for the client developer reading it in their logs: it says what happened, which
+     * payment the key already belongs to, which fields differ, and the two ways out. Field names
+     * only, never values - the same rule as validation errors.
+     */
+    @ExceptionHandler(IdempotencyKeyReusedException.class)
+    public ProblemDetail handleIdempotencyKeyReused(IdempotencyKeyReusedException ex) {
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.UNPROCESSABLE_ENTITY,
+                "Idempotency-Key '" + ex.getIdempotencyKey() + "' was already used for payment "
+                        + ex.getOriginalPaymentId() + " with a different request body. Differing "
+                        + "fields: " + String.join(", ", ex.getDifferingFields()) + ". "
+                        + "To retry that payment, resend its original body unchanged. "
+                        + "To create a new payment, use a new Idempotency-Key.");
+        body.setTitle("Idempotency-Key reused with a different request");
+        body.setProperty("idempotencyKey", ex.getIdempotencyKey());
+        body.setProperty("originalPaymentId", ex.getOriginalPaymentId());
+        body.setProperty("differingFields", ex.getDifferingFields());
         return body;
     }
 
