@@ -15,8 +15,12 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "simulator")
 public class SimulatorProperties {
 
-    /** Current behaviour. Changed at runtime via {@code PUT /control/mode}. */
-    private FailureMode mode = FailureMode.NORMAL;
+    /**
+     * Current behaviour. Changed at runtime via {@code PUT /control/mode}. Volatile because the
+     * write happens on one request thread and the reads on others; without it a flip to HTTP_500
+     * is not guaranteed to be seen by the next /authorize call.
+     */
+    private volatile FailureMode mode = FailureMode.NORMAL;
 
     /** Latency applied in {@link FailureMode#NORMAL}. */
     private Duration baseLatency = Duration.ofMillis(120);
