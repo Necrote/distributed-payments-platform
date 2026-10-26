@@ -3,7 +3,12 @@ package com.vivekpatel.simulator;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import java.time.Duration;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -27,7 +32,17 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 public class SimulatorController {
 
+    /** Fixed, not configurable: the 429 scenario is about the caller honouring it, not tuning it. */
+    private static final int RETRY_AFTER_SECONDS = 1;
+
     private final SimulatorProperties properties;
+
+    /**
+     * Approved authorisations by id, for capture and refund (Day 14) to look up. In memory on
+     * purpose - a restart is a reset. Concurrent because SLOW mode means many requests are in
+     * flight at once on different threads.
+     */
+    private final Map<String, AuthorizeRequest> authorizations = new ConcurrentHashMap<>();
 
     public SimulatorController(SimulatorProperties properties) {
         this.properties = properties;
@@ -36,28 +51,31 @@ public class SimulatorController {
     /**
      * Authorise a payment.
      *
-     * <p>TODO Phase 3 (Day 13): implement the switch over {@link FailureMode} - a Java 21 switch
-     * expression over the enum, so adding a mode without handling it fails to compile:
+     * <p>A switch <em>expression</em> over {@link FailureMode} with no {@code default}: adding a mode
+     * to the enum without handling it here is a compile error, not a silent fall-through to NORMAL.
+     * The three modes not built yet return 501 explicitly for the same reason - an unhandled mode
+     * should be loud.
      *
-     * <pre>
-     * return switch (properties.getMode()) {
-     *     case NORMAL   -&gt; sleepThenApprove(properties.getBaseLatency());
-     *     case SLOW     -&gt; sleepThenApprove(properties.getSlowLatency());
-     *     case TIMEOUT  -&gt; sleepForever();
-     *     case HTTP_500 -&gt; ResponseEntity.internalServerError().build();
-     *     case HTTP_429 -&gt; rateLimited();
-     *     ...
-     * };
-     * </pre>
-     *
-     * <p>The response must echo {@code requestId} so the caller can correlate a late response with
+     * <p>The response echoes {@code requestId} so the caller can correlate a late response with
      * the attempt that produced it - that correlation is the entire point of the
      * {@link FailureMode#DUPLICATE_RESPONSE} scenario.
      */
     @PostMapping("/authorize")
     public ResponseEntity<Map<String, Object>> authorize(@Valid @RequestBody AuthorizeRequest request) {
-        // TODO Phase 3 (Day 13).
-        return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
+        return switch (properties.getMode()) {
+            case NORMAL -> sleepThenAuthorize(properties.getBaseLatency(), request);
+            case SLOW -> sleepThenAuthorize(properties.getSlowLatency(), request);
+            // Not "never respond": the processor does the work and answers long after any sane
+            // client has given up. The money moved and the caller does not know - which is exactly
+            // the situation payment_attempts.outcome = UNKNOWN exists to represent.
+            case TIMEOUT -> sleepThenAuthorize(properties.getTimeoutLatency(), request);
+            case HTTP_500 -> ResponseEntity.internalServerError().body(error(request, "PROCESSOR_ERROR"));
+            case HTTP_429 -> ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header(HttpHeaders.RETRY_AFTER, String.valueOf(RETRY_AFTER_SECONDS))
+                    .body(error(request, "RATE_LIMITED"));
+            case INTERMITTENT, DUPLICATE_RESPONSE, OUTAGE -> ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED)
+                    .body(error(request, "MODE_NOT_IMPLEMENTED"));
+        };
     }
 
     /** TODO Phase 3 (Day 14): capture an existing authorisation. Same failure-mode switch. */
@@ -103,6 +121,44 @@ public class SimulatorController {
     @PostMapping("/control/reset")
     public ResponseEntity<Void> reset() {
         return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Behaviours
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * Sleep, then approve (or occasionally decline). Thread.sleep on a request thread is the point:
+     * a slow processor holds the CALLER's thread and connection for exactly this long.
+     *
+     * <p>A decline is a 200 with {@code status=DECLINED}: a business outcome, not a technical
+     * failure. The caller must not retry it and its circuit breaker must not count it.
+     */
+    private ResponseEntity<Map<String, Object>> sleepThenAuthorize(Duration latency, AuthorizeRequest request) {
+        try {
+            Thread.sleep(latency);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(error(request, "INTERRUPTED"));
+        }
+        if (ThreadLocalRandom.current().nextDouble() < properties.getDeclineRate()) {
+            return ResponseEntity.ok(Map.of(
+                    "requestId", request.requestId(),
+                    "status", "DECLINED",
+                    "declineCode", "INSUFFICIENT_FUNDS"));
+        }
+        String authorizationId = "auth_" + UUID.randomUUID();
+        authorizations.put(authorizationId, request);
+        return ResponseEntity.ok(Map.of(
+                "requestId", request.requestId(),
+                "authorizationId", authorizationId,
+                "status", "APPROVED",
+                "amount", request.amount(),
+                "currency", request.currency()));
+    }
+
+    private static Map<String, Object> error(AuthorizeRequest request, String code) {
+        return Map.of("requestId", request.requestId(), "error", code);
     }
 
     /**
