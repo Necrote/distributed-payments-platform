@@ -1,0 +1,9 @@
+# Only pom.xml and src/ are needed to build. Keeping target/ out matters most: a stale local jar
+# in the build context is how an image ends up running code that is not in the commit.
+target/
+.idea/
+*.iml
+.vscode/
+*.log
+Dockerfile
+.dockerignore
