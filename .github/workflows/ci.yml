@@ -15,10 +15,9 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------------------------
-  # payment-service is the only service that exists in Phase 1, so it is the only job that runs.
-  # The matrix below is deliberately a matrix of ONE: adding processor-simulator in Phase 3 and
-  # ledger-service in Phase 4 is a one-line change, and until then CI does not pretend to build
-  # things that are empty.
+  # One job per service that actually has code. processor-simulator joined in Phase 3 (Day 13);
+  # ledger-service joins in Phase 4 as a one-line change, and until then CI does not pretend to
+  # build things that are empty.
   # -------------------------------------------------------------------------------------------
   build:
     name: build ${{ matrix.service }}
@@ -28,7 +27,7 @@ jobs:
       matrix:
         service:
           - payment-service
-          # - processor-simulator   # enable in Phase 3 (Day 13)
+          - processor-simulator
           # - ledger-service        # enable in Phase 4 (Day 25)
 
     steps:
