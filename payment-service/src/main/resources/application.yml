@@ -8,7 +8,7 @@ spring:
     name: payment-service
 
   datasource:
-    url: ${PAYMENTS_DB_URL:jdbc:postgresql://localhost:5432/payments}
+    url: ${PAYMENTS_DB_URL:jdbc:postgresql://localhost:15432/payments}
     username: ${PAYMENTS_DB_USER:payments}
     password: ${PAYMENTS_DB_PASSWORD:payments}
     hikari:
