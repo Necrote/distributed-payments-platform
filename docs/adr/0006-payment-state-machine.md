@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-22 (the design dates from Day 1; this records it, now that it's tested under
-  concurrency)
+  concurrency) · **Revised:** 2026-10-31 (real authorisation replaced the temporary admin endpoint)
 - **Scope:** `payment-service`: `PaymentStatus`, `Payment`, every endpoint that changes a payment
 - **Related:** [ADR-004](0004-idempotency-keys.md), idempotency keys. ADR-004 stops a second
   *create*; this ADR stops an illegal or duplicated *transition*.
@@ -111,7 +111,7 @@ retry loop is how a loser fights a legitimate winner for a second capture.
   a refusal. `PaymentTest` now asserts that `CREATED → CAPTURED` throws *and* leaves the status and
   `updatedAt` untouched.
 - **Exactly one capture under a race.** Two simultaneous captures give one `200` and one `409`,
-  version `2` (create, authorise, one capture), over 20 runs. A deterministic twin forces both
+  version `3` (create, `PROCESSING`, `AUTHORIZED`, one capture), over 20 runs. A deterministic twin forces both
   transactions to hold a stale `AUTHORIZED` before either commits, using a barrier after the read,
   so the loser *must* hit the version check. With `@Version` removed, all 40 runs fail, and the HTTP
   race returns `[200, 200]`, which is the lost update made visible.
@@ -130,11 +130,11 @@ retry loop is how a loser fights a legitimate winner for a second capture.
   chargeback, and no authorisation expiry. Each is a real lifecycle of its own (disputes especially),
   and adding them here would mean more paths to test without making the design more convincing. The
   README lists them as limitations.
-- **`PROCESSING` carries a promise the code doesn't keep yet.** It means "an authorisation is in
-  flight, outcome unknown". A processor timeout must *not* move it to `FAILED` until the outcome is
-  confirmed or reconciled, because a timeout isn't a decline. That rule belongs to Phase 3's
-  processor integration. Until then, nothing enters `PROCESSING` except the temporary admin
-  `force-authorize` endpoint, which is off by default and deleted in Phase 3.
+- **`PROCESSING` has no way out yet after an unknown outcome.** It means "an authorisation is in
+  flight, outcome unknown". A processor timeout or `5xx` does *not* move it to `FAILED`, because a
+  timeout isn't a decline: the charge may exist. `AttemptOutcome.paymentStatusAfterAuthorization`
+  holds that rule, and `PaymentControllerIT` proves it for a timeout. But the payment then waits for
+  a retry or reconciliation, and neither is built, so today it stays `PROCESSING`.
 - **The loser of a race has to look before it retries.** Clients must treat a `409` as "fetch the
   payment, then decide". A client that blindly retries on `409` will just get another `409`. That's
   safe, but it needs to be in the API documentation.
@@ -148,5 +148,6 @@ retry loop is how a loser fights a legitimate winner for a second capture.
 | Illegal move → `409` with `currentStatus` | Built, tested (controller test, IT) |
 | Concurrent update → `409`, not retried | Built, tested (20-run HTTP race, deterministic twin) |
 | CHECK constraint on known statuses | Built (`V1__core_schema.sql`) |
-| `PROCESSING` timeout semantics, refund confirmation | Phase 3 |
+| Timeout or `5xx` leaves the payment `PROCESSING`, never `FAILED` | Built, tested (`PaymentControllerIT`, `PaymentAttemptTest`) |
+| Leaving `PROCESSING` after an unknown outcome (retry, reconciliation), refund confirmation | Phase 3 |
 | Refund race test | Not yet: same code path as capture, not separately proven |
