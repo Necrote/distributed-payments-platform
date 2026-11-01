@@ -36,16 +36,19 @@ class IdempotentPaymentCreatorTest {
     private static final String KEY = "key-1";
 
     private final PaymentApplicationService service = mock(PaymentApplicationService.class);
+    private final PaymentAuthorizer authorizer = mock(PaymentAuthorizer.class);
     private final ObjectMapper mapper = JsonMapper.builder().findAndAddModules().build();
-    private final IdempotentPaymentCreator creator = new IdempotentPaymentCreator(service, mapper);
+    private final IdempotentPaymentCreator creator = new IdempotentPaymentCreator(service, authorizer, mapper);
 
     @Test
-    void firstCallIsCreated() {
-        Payment payment = payment();
-        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenReturn(payment);
+    void firstCallCreatesThenAuthorizesAndReturnsTheAuthorizedPayment() {
+        Payment created = payment();
+        Payment authorized = payment();
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenReturn(created);
+        when(authorizer.authorize(created.getId(), KEY)).thenReturn(authorized);
 
         assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
-                .isEqualTo(new CreatePaymentResult.Created(payment));
+                .isEqualTo(new CreatePaymentResult.Created(authorized));
         verify(service, never()).findIdempotencyKey(any(), any());
     }
 
@@ -59,6 +62,8 @@ class IdempotentPaymentCreatorTest {
 
         assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
                 .isEqualTo(new CreatePaymentResult.Replayed(PaymentResponse.from(original)));
+        // A retry must never become a second call to the processor.
+        verify(authorizer, never()).authorize(any(), any());
     }
 
     @Test
@@ -73,6 +78,7 @@ class IdempotentPaymentCreatorTest {
                     assertThat(e.getOriginalPaymentId()).isEqualTo(original.getId());
                     assertThat(e.getDifferingFields()).containsExactly("amount");
                 });
+        verify(authorizer, never()).authorize(any(), any());
     }
 
     @Test

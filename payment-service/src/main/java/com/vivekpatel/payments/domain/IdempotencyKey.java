@@ -21,9 +21,11 @@ import org.springframework.data.domain.Persistable;
  * One row in {@code idempotency_keys}: a merchant's claim on an {@code Idempotency-Key}, and the
  * response that key will replay.
  *
- * <p>Lifecycle inside a single create transaction: {@link #claim} inserts the row with no payment
- * yet, the payment is inserted, then {@link #recordResponse} fills in what to replay. The row is
- * never updated after that transaction commits.
+ * <p>Lifecycle: inside the create transaction, {@link #claim} inserts the row with no payment yet,
+ * the payment is inserted, then {@link #recordResponse} fills in what to replay - the payment as
+ * {@code CREATED}. When the same request finishes authorising the payment, {@link #recordResponse}
+ * runs once more with the response that request actually returns. After that the row never
+ * changes. A retry that arrives mid-authorisation replays the {@code CREATED} snapshot.
  *
  * <p>{@code payment_id} is a plain UUID column, not a {@code @ManyToOne}. A replay needs the stored
  * response, not the payment entity, and a relationship would invite a lazy load nobody asked for.

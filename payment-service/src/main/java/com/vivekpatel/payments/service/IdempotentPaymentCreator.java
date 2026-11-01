@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
+import com.vivekpatel.payments.domain.Payment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -43,14 +44,21 @@ public class IdempotentPaymentCreator {
     static final String KEY_CONSTRAINT = "uq_idempotency_key_per_merchant";
 
     private final PaymentApplicationService payments;
+    private final PaymentAuthorizer authorizer;
     private final ObjectMapper objectMapper;
 
-    public IdempotentPaymentCreator(PaymentApplicationService payments, ObjectMapper objectMapper) {
+    public IdempotentPaymentCreator(
+            PaymentApplicationService payments, PaymentAuthorizer authorizer, ObjectMapper objectMapper) {
         this.payments = payments;
+        this.authorizer = authorizer;
         this.objectMapper = objectMapper;
     }
 
     /**
+     * Creates the payment and authorises it with the processor. A replay does neither: the
+     * request that created the payment also authorised it, and a retry must never become a second
+     * call to the processor.
+     *
      * @throws IdempotencyKeyReusedException if the key was used before with a different request.
      */
     public CreatePaymentResult create(
@@ -59,9 +67,10 @@ public class IdempotentPaymentCreator {
             String paymentMethodToken,
             String externalReference,
             String idempotencyKey) {
+        Payment created;
         try {
-            return new CreatePaymentResult.Created(payments.create(
-                    merchantId, amount, paymentMethodToken, externalReference, idempotencyKey));
+            created = payments.create(
+                    merchantId, amount, paymentMethodToken, externalReference, idempotencyKey);
         } catch (DataIntegrityViolationException e) {
             // Only OUR constraint means "already used". Any other integrity failure is a real
             // error and must not be turned into a lookup.
@@ -89,6 +98,9 @@ public class IdempotentPaymentCreator {
             }
             return new CreatePaymentResult.Replayed(original);
         }
+        // Outside the try: a failure while authorising is not a duplicate key, whatever it is.
+        // And after create's transaction has committed, so the processor call holds no connection.
+        return new CreatePaymentResult.Created(authorizer.authorize(created.getId(), idempotencyKey));
     }
 
     /**

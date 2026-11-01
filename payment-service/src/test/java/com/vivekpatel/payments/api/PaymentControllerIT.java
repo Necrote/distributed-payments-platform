@@ -14,6 +14,8 @@ import com.jayway.jsonpath.JsonPath;
 import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.domain.PaymentStatus;
 import com.vivekpatel.payments.persistence.PaymentRepository;
+import com.vivekpatel.payments.processor.FakeProcessor;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +25,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.skyscreamer.jsonassert.JSONAssert;
@@ -34,6 +38,8 @@ import org.springframework.boot.testcontainers.service.connection.ServiceConnect
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -58,6 +64,10 @@ import org.testcontainers.junit.jupiter.Testcontainers;
  *
  * <p>Tests share one database and do not clean up. Each creates its own payment with a fresh id,
  * so none depends on what the others left behind.
+ *
+ * <p>The processor is a {@link FakeProcessor} on a real local socket, so the whole path - request
+ * factory, timeouts, status mapping - runs as in production. It approves unless a test says
+ * otherwise, and goes back to approving after every test.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -68,6 +78,23 @@ class PaymentControllerIT {
     @Container
     @ServiceConnection
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    static FakeProcessor processor = FakeProcessor.start();
+
+    @DynamicPropertySource
+    static void processorUrl(DynamicPropertyRegistry registry) {
+        registry.add("payments.processor.base-url", processor::baseUrl);
+    }
+
+    @AfterEach
+    void processorBackToApproving() {
+        processor.approveAll();
+    }
+
+    @AfterAll
+    static void stopProcessor() {
+        processor.close();
+    }
 
     private static final String VALID_BODY =
             """
@@ -103,7 +130,7 @@ class PaymentControllerIT {
         mockMvc.perform(get(location))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.id").value(id))
-                .andExpect(jsonPath("$.status").value("CREATED"))
+                .andExpect(jsonPath("$.status").value("AUTHORIZED"))
                 .andExpect(jsonPath("$.amount").value(12500))
                 .andExpect(jsonPath("$.currency").value("INR"))
                 .andExpect(jsonPath("$.externalReference").value("order-827361"))
@@ -112,28 +139,108 @@ class PaymentControllerIT {
                 .andExpect(jsonPath("$.paymentMethodToken").doesNotExist());
     }
 
+    /**
+     * Today's "done": a create against an approving processor produces a payment, an attempt row,
+     * and AUTHORIZED - all from one POST.
+     */
     @Test
-    void captureOfACreatedPaymentIs409AndChangesNothing() throws Exception {
+    void createAuthorizesWithTheProcessorAndRecordsTheAttempt() throws Exception {
+        UUID id = createPayment();
+
+        Map<String, Object> payment =
+                jdbc.queryForMap("SELECT status, version FROM payments WHERE id = ?", id);
+        assertThat(payment).containsEntry("status", "AUTHORIZED");
+        // create = 0, -> PROCESSING = 1, -> AUTHORIZED = 2: two committed steps, not one.
+        assertThat(payment).containsEntry("version", 2L);
+
+        Map<String, Object> attempt = jdbc.queryForMap(
+                """
+                SELECT attempt_number, operation, outcome, processor_reference, error_code, latency_ms
+                FROM payment_attempts WHERE payment_id = ?
+                """,
+                id);
+        assertThat(attempt)
+                .containsEntry("attempt_number", 1)
+                .containsEntry("operation", "AUTHORIZE")
+                .containsEntry("outcome", "SUCCESS")
+                .containsEntry("error_code", null);
+        assertThat((String) attempt.get("processor_reference")).startsWith("auth_");
+        assertThat((Integer) attempt.get("latency_ms")).isNotNull().isNotNegative();
+
+        // What the processor was sent: our stable request id, and minor units.
+        assertThat(processor.requestBodies().getLast())
+                .contains("\"requestId\":\"authorize:" + id + "\"")
+                .contains("\"amount\":12500");
+    }
+
+    /**
+     * The pitfall, end to end: a decline is a business outcome. The request succeeded (201), the
+     * payment is FAILED, and the attempt says why. Nothing about it is a server error.
+     */
+    @Test
+    void declinedPaymentIsCreatedAsFailedWithTheDeclineCodeRecorded() throws Exception {
+        processor.declineAll("INSUFFICIENT_FUNDS");
+
+        String body = mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("FAILED"))
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(JsonPath.read(body, "$.id"));
+
+        assertThat(jdbc.queryForMap(
+                        "SELECT outcome, error_code, processor_reference FROM payment_attempts WHERE payment_id = ?",
+                        id))
+                .containsEntry("outcome", "FAILURE")
+                .containsEntry("error_code", "INSUFFICIENT_FUNDS")
+                .containsEntry("processor_reference", null);
+    }
+
+    /**
+     * A timeout is not a decline. The payment stays PROCESSING - not FAILED - because the
+     * processor may have charged the card after we stopped listening.
+     */
+    @Test
+    void processorTimeoutLeavesThePaymentProcessingNotFailed() throws Exception {
+        // Past the test profile's 1 s read timeout.
+        processor.approveAfter(Duration.ofSeconds(3));
+
+        String body = mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("PROCESSING"))
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(JsonPath.read(body, "$.id"));
+
+        assertThat(jdbc.queryForObject("SELECT status FROM payments WHERE id = ?", String.class, id))
+                .isEqualTo("PROCESSING");
+        Map<String, Object> attempt = jdbc.queryForMap(
+                "SELECT outcome, error_code, latency_ms FROM payment_attempts WHERE payment_id = ?", id);
+        assertThat(attempt)
+                .containsEntry("outcome", "TIMEOUT")
+                .containsEntry("error_code", "READ_TIMEOUT");
+        // We gave up at our deadline (~1 s), not when the processor finished (3 s).
+        assertThat((Integer) attempt.get("latency_ms")).isBetween(900, 2500);
+    }
+
+    @Test
+    void captureOfADeclinedPaymentIs409AndChangesNothing() throws Exception {
+        processor.declineAll("DO_NOT_HONOR");
         UUID id = createPayment();
 
         mockMvc.perform(post("/payments/{id}/capture", id))
                 .andExpect(status().isConflict())
                 .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
                 .andExpect(jsonPath("$.title").value("Illegal payment state transition"))
-                .andExpect(jsonPath("$.currentStatus").value("CREATED"));
+                .andExpect(jsonPath("$.currentStatus").value("FAILED"));
 
-        // The rejection happened before any write: still CREATED, version untouched.
+        // The rejection happened before any write: still FAILED, version where authorisation left it.
         Payment row = payments.findById(id).orElseThrow();
-        assertThat(row.getStatus()).isEqualTo(PaymentStatus.CREATED);
-        assertThat(row.getVersion()).isZero();
+        assertThat(row.getStatus()).isEqualTo(PaymentStatus.FAILED);
+        assertThat(row.getVersion()).isEqualTo(2L);
     }
 
     @Test
     void authorizedPaymentCanBeCapturedOnceThenRefunded() throws Exception {
         UUID id = createPayment();
-        mockMvc.perform(post("/admin/payments/{id}/force-authorize", id))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("AUTHORIZED"));
 
         mockMvc.perform(post("/payments/{id}/capture", id))
                 .andExpect(status().isOk())
@@ -155,7 +262,6 @@ class PaymentControllerIT {
     void refundOfAnAuthorizedPaymentIs409() throws Exception {
         // Nothing was captured, so there is nothing to give back: that is a void, not a refund.
         UUID id = createPayment();
-        mockMvc.perform(post("/admin/payments/{id}/force-authorize", id)).andExpect(status().isOk());
 
         mockMvc.perform(post("/payments/{id}/refund", id))
                 .andExpect(status().isConflict())
@@ -177,7 +283,6 @@ class PaymentControllerIT {
     @RepeatedTest(20)
     void twoSimultaneousCapturesProduceExactlyOneCapture() throws Exception {
         UUID id = createPayment();
-        mockMvc.perform(post("/admin/payments/{id}/force-authorize", id)).andExpect(status().isOk());
 
         CountDownLatch start = new CountDownLatch(1);
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -208,12 +313,12 @@ class PaymentControllerIT {
             pool.shutdownNow();
         }
 
-        // Exactly one write: create = 0, force-authorize (one transaction, one UPDATE) = 1,
-        // one capture = 2. A double capture would be 3, or a lost update would hide at 2 with
-        // two 200s - which the status assertion above already rules out.
+        // Exactly one capture write: create = 0, -> PROCESSING = 1, -> AUTHORIZED = 2, one
+        // capture = 3. A double capture would be 4, or a lost update would hide at 3 with two
+        // 200s - which the status assertion above already rules out.
         Payment row = payments.findById(id).orElseThrow();
         assertThat(row.getStatus()).isEqualTo(PaymentStatus.CAPTURED);
-        assertThat(row.getVersion()).isEqualTo(2L);
+        assertThat(row.getVersion()).isEqualTo(3L);
     }
 
     @Test
@@ -365,16 +470,23 @@ class PaymentControllerIT {
                         .andExpect(status().isCreated())
                         .andReturn();
         String id = JsonPath.read(first.getResponse().getContentAsString(), "$.id");
-        mockMvc.perform(post("/admin/payments/{id}/force-authorize", id)).andExpect(status().isOk());
+        mockMvc.perform(post("/payments/{id}/capture", id)).andExpect(status().isOk());
+        int processorCalls = processor.requestBodies().size();
 
-        // The retry asks "what happened to my create?" - and the create returned CREATED.
-        mockMvc.perform(post("/payments")
+        // The retry asks "what happened to my create?" - and the create returned AUTHORIZED: the
+        // payment after authorisation, not the CREATED snapshot, and not today's CAPTURED.
+        MvcResult replay = mockMvc.perform(post("/payments")
                         .header("Idempotency-Key", key)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(VALID_BODY))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.id").value(id))
-                .andExpect(jsonPath("$.status").value("CREATED"));
+                .andExpect(jsonPath("$.status").value("AUTHORIZED"))
+                .andReturn();
+        assertThat(replay.getResponse().getContentAsString())
+                .isEqualTo(first.getResponse().getContentAsString());
+        // And a replay never calls the processor: one authorisation per payment.
+        assertThat(processor.requestBodies()).hasSize(processorCalls);
     }
 
     @Test

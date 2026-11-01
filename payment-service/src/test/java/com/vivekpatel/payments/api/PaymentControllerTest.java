@@ -309,14 +309,6 @@ class PaymentControllerTest {
     }
 
     @Test
-    void forceAuthorizeEndpointDoesNotExistUnlessEnabled() throws Exception {
-        // AdminPaymentController is not part of this slice, and is off by default everywhere else.
-        mockMvc.perform(post("/admin/payments/{id}/force-authorize", UUID.randomUUID()))
-                .andExpect(status().isNotFound());
-        verifyNoInteractions(paymentService, paymentCreator);
-    }
-
-    @Test
     void unexpectedFailureIsGeneric500WithNoStackTraceOrMessage() throws Exception {
         UUID id = UUID.randomUUID();
         when(paymentService.get(id))

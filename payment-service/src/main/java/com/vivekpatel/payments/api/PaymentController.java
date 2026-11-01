@@ -158,8 +158,6 @@ public class PaymentController {
     public ResponseEntity<PaymentResponse> capturePayment(
             @PathVariable UUID paymentId,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
-        // TODO Phase 3 (Day 13): there is no processor yet, so a payment only reaches AUTHORIZED
-        // through the admin-forced authorisation in AdminPaymentController.
         return ResponseEntity.ok(PaymentResponse.from(paymentService.capture(paymentId)));
     }
 
