@@ -61,11 +61,11 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------------------------------
-  # Mutation testing. Enabled Day 11, after measuring: 91/121 mutants killed (75%). The threshold
-  # in payment-service/pom.xml is 75 - just under the measurement - and fails this job if the
-  # score drops. Proven locally before trusting it: disabling one test (PaymentTest's illegal-
-  # transition check) took the score to 74 and failed the build. A threshold invented before the
-  # first measurement is theatre.
+  # Mutation testing. Enabled Day 11, after measuring: 91/121 mutants killed (75%). Raised on Day
+  # 14 to 83, after measuring 130/156 (83%); the history is in payment-service/pom.xml. The gate
+  # fails this job if the score drops. Proven locally before trusting it: disabling one test
+  # (PaymentTest's illegal-transition check) took the score to 74 and failed the build. A
+  # threshold invented before the first measurement is theatre.
   # -------------------------------------------------------------------------------------------
   mutation-testing:
     name: PIT mutation score
