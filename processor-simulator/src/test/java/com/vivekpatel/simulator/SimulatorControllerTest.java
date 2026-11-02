@@ -54,6 +54,17 @@ class SimulatorControllerTest {
     }
 
     @Test
+    void aRepeatedRequestIdGetsTheSameAuthorizationInsteadOfASecondOne() throws Exception {
+        // What makes a caller's retry safe: without this, retrying after a broken connection would
+        // really authorise twice here.
+        String first = authorize().andReturn().getResponse().getContentAsString();
+        String second = authorize().andReturn().getResponse().getContentAsString();
+
+        assertThat(second).isEqualTo(first);
+        assertThat(first).contains("auth_");
+    }
+
+    @Test
     void slowStillSucceedsButHoldsTheCallerForTheConfiguredLatency() throws Exception {
         setMode("SLOW");
         long started = System.nanoTime();

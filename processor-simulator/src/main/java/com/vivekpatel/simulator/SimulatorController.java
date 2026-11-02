@@ -44,6 +44,13 @@ public class SimulatorController {
      */
     private final Map<String, AuthorizeRequest> authorizations = new ConcurrentHashMap<>();
 
+    /**
+     * The answer already given for each request id. A repeated id gets that answer and creates
+     * nothing new, as a real processor's idempotency key would. Without this, a caller's safe retry
+     * would really charge twice here, and the scenario would prove the opposite of what it claims.
+     */
+    private final Map<String, Map<String, Object>> answersByRequestId = new ConcurrentHashMap<>();
+
     public SimulatorController(SimulatorProperties properties) {
         this.properties = properties;
     }
@@ -117,7 +124,7 @@ public class SimulatorController {
         return Map.of("mode", mode.name(), "description", mode.description());
     }
 
-    /** TODO Phase 3 (Day 17): reset counters, clear the in-memory authorisation store, mode=NORMAL. */
+    /** TODO Phase 3 (Day 17): reset counters, clear the in-memory stores, mode=NORMAL. */
     @PostMapping("/control/reset")
     public ResponseEntity<Void> reset() {
         return ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED).build();
@@ -141,20 +148,24 @@ public class SimulatorController {
             Thread.currentThread().interrupt();
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(error(request, "INTERRUPTED"));
         }
+        return ResponseEntity.ok(answersByRequestId.computeIfAbsent(request.requestId(), id -> decide(request)));
+    }
+
+    private Map<String, Object> decide(AuthorizeRequest request) {
         if (ThreadLocalRandom.current().nextDouble() < properties.getDeclineRate()) {
-            return ResponseEntity.ok(Map.of(
+            return Map.of(
                     "requestId", request.requestId(),
                     "status", "DECLINED",
-                    "declineCode", "INSUFFICIENT_FUNDS"));
+                    "declineCode", "INSUFFICIENT_FUNDS");
         }
         String authorizationId = "auth_" + UUID.randomUUID();
         authorizations.put(authorizationId, request);
-        return ResponseEntity.ok(Map.of(
+        return Map.of(
                 "requestId", request.requestId(),
                 "authorizationId", authorizationId,
                 "status", "APPROVED",
                 "amount", request.amount(),
-                "currency", request.currency()));
+                "currency", request.currency());
     }
 
     private static Map<String, Object> error(AuthorizeRequest request, String code) {
