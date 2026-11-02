@@ -3,6 +3,8 @@ package com.vivekpatel.payments.processor;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import io.github.resilience4j.timelimiter.TimeLimiterConfig;
+import io.github.resilience4j.timelimiter.TimeLimiterRegistry;
 import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.UUID;
@@ -19,6 +21,7 @@ class ProcessorClientTest {
 
     private static final FakeProcessor processor = FakeProcessor.start();
     private static final Duration READ_TIMEOUT = Duration.ofMillis(300);
+    private static final Duration CALL_LIMIT = Duration.ofSeconds(1);
 
     private final ProcessorClient client = clientFor(processor.baseUrl());
     private final AuthorizeRequest request = new AuthorizeRequest(
@@ -101,7 +104,30 @@ class ProcessorClientTest {
     }
 
     @Test
-    void connectionRefusedIsNotProcessedNotATimeout() throws Exception {
+    void bodyStalledAfterTheHeadersIsCutOffByTheTimeLimiter() {
+        // The read timeout has already passed by the time this ends: it stops at the headers. Only
+        // the limiter bounds the whole call, and without it this call would wait out the stall.
+        processor.stallBodyFor(Duration.ofSeconds(5));
+
+        long started = System.nanoTime();
+        assertThatThrownBy(() -> client.authorize(request))
+                .isInstanceOf(ProcessorException.TimedOut.class);
+        assertThat(Duration.ofNanos(System.nanoTime() - started))
+                .isBetween(CALL_LIMIT.minusMillis(100), Duration.ofSeconds(3));
+    }
+
+    @Test
+    void aConnectionThatBreaksAfterSendingIsBrokenNotRefused() {
+        // Not ConnectFailed: the request went out, so the charge may exist.
+        processor.breakNextConnections(1);
+
+        assertThatThrownBy(() -> client.authorize(request))
+                .isInstanceOfSatisfying(ProcessorException.ConnectionBroken.class,
+                        e -> assertThat(e.errorCode()).isEqualTo("IO_ERROR"));
+    }
+
+    @Test
+    void connectionRefusedIsConnectFailedNotATimeout() throws Exception {
         // A port that was free a moment ago and has nothing listening now.
         int closedPort;
         try (ServerSocket socket = new ServerSocket(0)) {
@@ -110,7 +136,7 @@ class ProcessorClientTest {
         ProcessorClient nowhere = clientFor("http://127.0.0.1:" + closedPort);
 
         assertThatThrownBy(() -> nowhere.authorize(request))
-                .isInstanceOfSatisfying(ProcessorException.NotProcessed.class,
+                .isInstanceOfSatisfying(ProcessorException.ConnectFailed.class,
                         e -> assertThat(e.errorCode()).isEqualTo("CONNECT_FAILED"));
     }
 
@@ -151,13 +177,16 @@ class ProcessorClientTest {
 
     @Test
     void missingTimeoutFailsAtConstructionNotAtTheFirstSlowCall() {
-        assertThatThrownBy(() -> new ProcessorProperties(processor.baseUrl(), Duration.ofMillis(500), null))
+        assertThatThrownBy(() -> new ProcessorProperties(
+                        processor.baseUrl(), Duration.ofMillis(500), null, Duration.ofSeconds(3)))
                 .isInstanceOf(NullPointerException.class)
                 .hasMessageContaining("read-timeout");
     }
 
     private static ProcessorClient clientFor(String baseUrl) {
         return new ProcessorClient(
-                RestClient.builder(), new ProcessorProperties(baseUrl, Duration.ofMillis(500), READ_TIMEOUT));
+                RestClient.builder(),
+                new ProcessorProperties(baseUrl, Duration.ofMillis(500), READ_TIMEOUT, Duration.ofSeconds(3)),
+                TimeLimiterRegistry.of(TimeLimiterConfig.custom().timeoutDuration(CALL_LIMIT).build()));
     }
 }

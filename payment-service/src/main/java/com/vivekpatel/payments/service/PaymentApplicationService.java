@@ -191,22 +191,40 @@ public class PaymentApplicationService {
     public AuthorizationStarted startAuthorization(UUID paymentId) {
         Payment payment = load(paymentId);
         payment.transitionTo(PaymentStatus.PROCESSING, clock);
-        int attemptNumber =
-                Math.toIntExact(attempts.countByPaymentIdAndOperation(paymentId, AttemptOperation.AUTHORIZE)) + 1;
-        PaymentAttempt attempt =
-                attempts.save(PaymentAttempt.start(paymentId, attemptNumber, AttemptOperation.AUTHORIZE, clock));
-        return new AuthorizationStarted(payment, attempt.getId());
+        return new AuthorizationStarted(payment, openAuthorizeAttempt(paymentId));
     }
 
     /**
-     * The second half: record how the call ended, and move the payment if the outcome says where
+     * A retry's bookkeeping: closes an attempt that is not the last. The payment does not move,
+     * because the authorisation is still going on.
+     */
+    @Transactional
+    public void recordFailedAttempt(UUID attemptId, AttemptResult result, Duration latency) {
+        loadAttempt(attemptId).complete(
+                result.outcome(), result.processorReference(), result.errorCode(), latency);
+    }
+
+    /**
+     * Opens the {@code PENDING} row for a retry, committed before the call for the same reason as
+     * the first attempt's. One row per call, numbered in order, because each call could be a charge.
+     *
+     * @return the new attempt's id.
+     */
+    @Transactional
+    public UUID startNextAttempt(UUID paymentId) {
+        return openAuthorizeAttempt(paymentId);
+    }
+
+    /**
+     * The second half: record how the last call ended, and move the payment if the outcome says where
      * to - see {@link AttemptOutcome#paymentStatusAfterAuthorization()}. On a timeout or an unknown
      * outcome the payment stays {@code PROCESSING}.
      *
      * <p>If the payment was created with an {@code Idempotency-Key}, the stored response is
      * replaced with the one this request is about to return. A replay is the original response
      * (ADR-004), and the original response is the payment after authorisation, not the
-     * {@code CREATED} snapshot written by {@link #create}.
+     * {@code CREATED} snapshot written by {@link #create}. When the outcome is unknown that response
+     * is a {@code 504}, and the stored status says so, so that a retry gets a 504 too.
      *
      * <p>If this transaction fails after the processor approved - the database is down, say - the
      * charge exists and this service does not know it: the payment stays {@code PROCESSING} and the
@@ -216,21 +234,33 @@ public class PaymentApplicationService {
     @Transactional
     public Payment completeAuthorization(
             UUID attemptId, AttemptResult result, Duration latency, String idempotencyKey) {
-        PaymentAttempt attempt = attempts.findById(attemptId)
-                .orElseThrow(() -> new IllegalStateException("No payment attempt with id " + attemptId));
+        PaymentAttempt attempt = loadAttempt(attemptId);
         attempt.complete(result.outcome(), result.processorReference(), result.errorCode(), latency);
 
         Payment payment = load(attempt.getPaymentId());
-        result.outcome().paymentStatusAfterAuthorization()
-                .ifPresent(target -> payment.transitionTo(target, clock));
+        Optional<PaymentStatus> target = result.outcome().paymentStatusAfterAuthorization();
+        target.ifPresent(status -> payment.transitionTo(status, clock));
 
         if (idempotencyKey != null) {
+            HttpStatus responseStatus = target.isPresent() ? HttpStatus.CREATED : HttpStatus.GATEWAY_TIMEOUT;
             // Through the unique index on (merchant_id, idempotency_key); payment_id has no index.
             idempotencyKeys.findByMerchantIdAndIdempotencyKey(payment.getMerchantId(), idempotencyKey)
                     .ifPresent(key -> key.recordResponse(
-                            payment.getId(), HttpStatus.CREATED.value(), responseBody(payment)));
+                            payment.getId(), responseStatus.value(), responseBody(payment)));
         }
         return payment;
+    }
+
+    private UUID openAuthorizeAttempt(UUID paymentId) {
+        int attemptNumber =
+                Math.toIntExact(attempts.countByPaymentIdAndOperation(paymentId, AttemptOperation.AUTHORIZE)) + 1;
+        return attempts.save(PaymentAttempt.start(paymentId, attemptNumber, AttemptOperation.AUTHORIZE, clock))
+                .getId();
+    }
+
+    private PaymentAttempt loadAttempt(UUID attemptId) {
+        return attempts.findById(attemptId)
+                .orElseThrow(() -> new IllegalStateException("No payment attempt with id " + attemptId));
     }
 
     /**

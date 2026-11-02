@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 /**
@@ -33,7 +34,9 @@ public final class FakeProcessor implements AutoCloseable {
 
     private final HttpServer server;
     private final List<String> requestBodies = new CopyOnWriteArrayList<>();
+    private final AtomicInteger connectionsToBreak = new AtomicInteger();
     private volatile Function<String, Reply> replies = FakeProcessor::approve;
+    private volatile Duration bodyStall = Duration.ZERO;
 
     private FakeProcessor(HttpServer server) {
         this.server = server;
@@ -60,6 +63,18 @@ public final class FakeProcessor implements AutoCloseable {
 
     public void approveAll() {
         replies = FakeProcessor::approve;
+        connectionsToBreak.set(0);
+        bodyStall = Duration.ZERO;
+    }
+
+    /** The next {@code count} requests are received, then the connection closes with no response. */
+    public void breakNextConnections(int count) {
+        connectionsToBreak.set(count);
+    }
+
+    /** Sends the headers at once, then holds the body back: the case a read timeout does not cover. */
+    public void stallBodyFor(Duration stall) {
+        bodyStall = stall;
     }
 
     public void declineAll(String declineCode) {
@@ -91,6 +106,9 @@ public final class FakeProcessor implements AutoCloseable {
         try (exchange) {
             String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
             requestBodies.add(body);
+            if (connectionsToBreak.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                return;
+            }
             JsonNode requestId = JSON.readTree(body).get("requestId");
             Reply reply = replies.apply(requestId == null ? "" : requestId.asText());
             if (!reply.delay().isZero()) {
@@ -99,6 +117,10 @@ public final class FakeProcessor implements AutoCloseable {
             byte[] bytes = reply.body().getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json");
             exchange.sendResponseHeaders(reply.status(), bytes.length);
+            if (!bodyStall.isZero()) {
+                exchange.getResponseBody().flush();
+                Thread.sleep(bodyStall);
+            }
             exchange.getResponseBody().write(bytes);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

@@ -15,13 +15,17 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *     the processor is not there.
  * @param readTimeout how long to wait for the response once the request is sent. Must be below the
  *     client-facing deadline, or our caller gives up before we do and we keep working for nobody.
+ * @param totalDeadline how long one authorisation may take across every retry. An attempt only
+ *     starts if it could finish inside this, so it is the bound a client can rely on.
  */
 @ConfigurationProperties(prefix = "payments.processor")
-public record ProcessorProperties(String baseUrl, Duration connectTimeout, Duration readTimeout) {
+public record ProcessorProperties(
+        String baseUrl, Duration connectTimeout, Duration readTimeout, Duration totalDeadline) {
 
     public ProcessorProperties {
         Objects.requireNonNull(baseUrl, "payments.processor.base-url must be set");
         Objects.requireNonNull(connectTimeout, "payments.processor.connect-timeout must be set");
         Objects.requireNonNull(readTimeout, "payments.processor.read-timeout must be set");
+        Objects.requireNonNull(totalDeadline, "payments.processor.total-deadline must be set");
     }
 }

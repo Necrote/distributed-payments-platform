@@ -1,11 +1,15 @@
 package com.vivekpatel.payments.processor;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.github.resilience4j.timelimiter.TimeLimiter;
+import io.github.resilience4j.timelimiter.TimeLimiterRegistry;
 import java.io.IOException;
 import java.net.ConnectException;
 import java.net.http.HttpClient;
 import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpTimeoutException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeoutException;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
@@ -25,12 +29,17 @@ import org.springframework.web.client.RestClientException;
  *       money.</li>
  * </ul>
  * No Spring or JDK HTTP exception escapes this class, so callers never have to know which client
- * library sits underneath, and the resilience layer (Phase 3) has three exception types to reason
- * about instead of dozens.
+ * library sits underneath, and the retry configuration can name a few exception types of ours
+ * instead of dozens of theirs.
  *
  * <p><b>Timeouts are explicit.</b> The request factory is chosen and configured here rather than
  * left to Spring Boot's classpath detection, so the timeouts in {@link ProcessorProperties} are the
  * ones in force and nothing depends on which HTTP library happens to be on the classpath.
+ *
+ * <p><b>The read timeout does not bound the whole call.</b> It stops at the response headers, so a
+ * processor that sends headers and then stalls the body would hold the caller indefinitely. The
+ * time limiter is the backstop for that: it bounds one call end to end, which is why it runs on a
+ * thread of its own and why {@code timeoutDuration} sits above the read timeout, not on it.
  *
  * <p>No retries here, deliberately. Whether a failure may be retried depends on what it was and on
  * the operation; that decision belongs to the caller, not the transport.
@@ -38,9 +47,15 @@ import org.springframework.web.client.RestClientException;
 @Component
 public class ProcessorClient {
 
-    private final RestClient restClient;
+    /** Virtual threads, because each call only waits; they are not capacity for anything else. */
+    private final ExecutorService callThreads = Executors.newVirtualThreadPerTaskExecutor();
 
-    public ProcessorClient(RestClient.Builder builder, ProcessorProperties properties) {
+    private final RestClient restClient;
+    private final TimeLimiter timeLimiter;
+
+    public ProcessorClient(
+            RestClient.Builder builder, ProcessorProperties properties, TimeLimiterRegistry timeLimiters) {
+        this.timeLimiter = timeLimiters.timeLimiter("processor");
         HttpClient httpClient =
                 HttpClient.newBuilder()
                         .connectTimeout(properties.connectTimeout())
@@ -61,6 +76,21 @@ public class ProcessorClient {
      * @throws ProcessorException if there was no answer; the subtype says what is known.
      */
     public AuthorizationDecision authorize(AuthorizeRequest request) {
+        try {
+            return timeLimiter.executeFutureSupplier(() -> callThreads.submit(() -> send(request)));
+        } catch (ProcessorException e) {
+            throw e;
+        } catch (TimeoutException e) {
+            throw new ProcessorException.TimedOut(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ProcessorException.OutcomeUnknown("INTERRUPTED", e);
+        } catch (Exception e) {
+            throw new ProcessorException.OutcomeUnknown("CLIENT_ERROR", e);
+        }
+    }
+
+    private AuthorizationDecision send(AuthorizeRequest request) {
         try {
             return restClient.post()
                     .uri("/authorize")
@@ -133,13 +163,13 @@ public class ProcessorClient {
     static ProcessorException classify(ResourceAccessException e) {
         for (Throwable t = e.getCause(); t != null; t = t.getCause()) {
             if (t instanceof HttpConnectTimeoutException || t instanceof ConnectException) {
-                return new ProcessorException.NotProcessed("CONNECT_FAILED", e);
+                return new ProcessorException.ConnectFailed(e);
             }
             if (t instanceof HttpTimeoutException || t instanceof TimeoutException) {
                 return new ProcessorException.TimedOut(e);
             }
         }
-        return new ProcessorException.OutcomeUnknown("IO_ERROR", e);
+        return new ProcessorException.ConnectionBroken(e);
     }
 
     /**

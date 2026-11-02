@@ -117,6 +117,49 @@ class PaymentApplicationServiceTest {
     }
 
     @Test
+    void anUnknownOutcomeStoresA504SoAReplayCannotReadAsSuccess() {
+        Payment payment = processing();
+        PaymentAttempt attempt = pendingAttemptFor(payment);
+        IdempotencyKey key = IdempotencyKey.claim("m-1", "key-1", "a".repeat(64), Duration.ofHours(24), FIXED);
+        key.recordResponse(payment.getId(), 201, "{\"status\":\"CREATED\"}");
+        when(keys.findByMerchantIdAndIdempotencyKey("m-1", "key-1")).thenReturn(Optional.of(key));
+
+        service.completeAuthorization(
+                attempt.getId(), new AttemptResult(AttemptOutcome.TIMEOUT, null, "READ_TIMEOUT"), LATENCY, "key-1");
+
+        assertThat(key.getResponseStatus()).isEqualTo(504);
+        assertThat(key.getResponseBody()).contains("\"status\":\"PROCESSING\"");
+    }
+
+    @Test
+    void aFailedAttemptIsClosedWithoutMovingThePaymentBecauseARetryFollows() {
+        Payment payment = processing();
+        PaymentAttempt attempt = pendingAttemptFor(payment);
+
+        service.recordFailedAttempt(
+                attempt.getId(), new AttemptResult(AttemptOutcome.FAILURE, null, "CONNECT_FAILED"), LATENCY);
+
+        assertThat(attempt.getOutcome()).isEqualTo(AttemptOutcome.FAILURE);
+        assertThat(attempt.getErrorCode()).isEqualTo("CONNECT_FAILED");
+        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.PROCESSING);
+    }
+
+    @Test
+    void aRetryOpensTheNextNumberedAttemptWithoutMovingThePayment() {
+        Payment payment = processing();
+        when(attempts.countByPaymentIdAndOperation(payment.getId(), AttemptOperation.AUTHORIZE)).thenReturn(1L);
+        PaymentAttempt[] saved = new PaymentAttempt[1];
+        when(attempts.save(any(PaymentAttempt.class))).then(inv -> saved[0] = inv.getArgument(0));
+
+        UUID next = service.startNextAttempt(payment.getId());
+
+        assertThat(next).isEqualTo(saved[0].getId());
+        assertThat(saved[0].getAttemptNumber()).isEqualTo(2);
+        assertThat(saved[0].getOutcome()).isEqualTo(AttemptOutcome.PENDING);
+        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.PROCESSING);
+    }
+
+    @Test
     void withoutAKeyNoIdempotencyRowIsTouched() {
         Payment payment = processing();
         PaymentAttempt attempt = pendingAttemptFor(payment);

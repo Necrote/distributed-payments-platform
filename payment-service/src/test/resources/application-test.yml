@@ -7,3 +7,15 @@ payments:
     # A short read timeout so the timeout scenario costs one second, not two.
     connect-timeout: 500ms
     read-timeout: 1s
+    # The same shape as production, scaled down: a read timeout leaves no room for a retry.
+    total-deadline: 2s
+
+resilience4j:
+  timelimiter:
+    instances:
+      processor:
+        timeoutDuration: 1500ms
+  retry:
+    instances:
+      processor:
+        waitDuration: 20ms

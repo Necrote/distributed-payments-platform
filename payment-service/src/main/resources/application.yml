@@ -76,28 +76,46 @@ payments:
     base-url: ${PROCESSOR_BASE_URL:http://localhost:8081}
     connect-timeout: 500ms
     read-timeout: 2s                # must be < the client-facing SLO, or the caller times out first
+    # An attempt only starts if the time limiter's 2500ms still fits inside this. The value comes
+    # from two sums, and both matter:
+    #   - Three failed connects: attempt 3 starts by 0.5 + 0.3 + 0.5 + 0.6 = 1.9s (connect timeouts
+    #     plus the longest backoffs), and 1.9 + 2.5 = 4.4s. So all three attempts fit.
+    #   - One read timeout: 2.0 + 2.5 = 4.5s, which does not fit. So the client gets its answer in
+    #     ~2s, not the ~6.6s of three 2s attempts, each of which could be a charge we never hear of.
+    # Changing the connect, read or limiter values means redoing these sums.
+    total-deadline: 4400ms
   idempotency:
     key-ttl: 24h                    # how long a replayed key returns the original response
 
-# Phase 3 (Day 15-17). Left commented so the first commit does not claim resilience it has not
+resilience4j:
+  timelimiter:
+    instances:
+      processor:
+        # One call, end to end. Changed from 2s on purpose: at 2s it would race the read timeout
+        # for no benefit. Its job is what the read timeout misses, such as a processor that sends
+        # headers and then stalls the body. Keep it at or above connect + read.
+        timeoutDuration: 2500ms
+  retry:
+    instances:
+      processor:
+        maxAttempts: 3                    # the first call plus two retries
+        waitDuration: 200ms               # then 400ms: doubled by the multiplier below
+        enableExponentialBackoff: true
+        exponentialBackoffMultiplier: 2
+        enableRandomizedWait: true        # jitter: without it, retries synchronise into a storm
+        randomizedWaitFactor: 0.5         # each wait lands within +/-50%
+        # Our own types, not IOException and TimeoutException as first drafted: ProcessorClient
+        # translates those, so they would never match and nothing would ever retry. Everything
+        # unlisted is final: declines are not exceptions at all, a 4xx would get the same answer,
+        # and a 5xx is left for the circuit breaker (Day 16).
+        retryExceptions:
+          - com.vivekpatel.payments.processor.ProcessorException$ConnectFailed
+          - com.vivekpatel.payments.processor.ProcessorException$TimedOut
+          - com.vivekpatel.payments.processor.ProcessorException$ConnectionBroken
+
+# Phase 3 (Day 16-17). Left commented so this file does not claim resilience it has not
 # demonstrated; the guide switches these on one at a time, each with a failure scenario.
 # resilience4j:
-#   timelimiter:
-#     instances:
-#       processor:
-#         timeoutDuration: 2s
-#   retry:
-#     instances:
-#       processor:
-#         maxAttempts: 3
-#         waitDuration: 200ms
-#         enableExponentialBackoff: true
-#         exponentialBackoffMultiplier: 2
-#         enableRandomizedWait: true      # jitter: without it, retries synchronise into a storm
-#         randomizedWaitFactor: 0.5
-#         retryExceptions:
-#           - java.io.IOException
-#           - java.util.concurrent.TimeoutException
 #   circuitbreaker:
 #     instances:
 #       processor:
