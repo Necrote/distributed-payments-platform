@@ -196,19 +196,27 @@ class PaymentControllerIT {
     }
 
     /**
-     * A timeout is not a decline. The payment stays PROCESSING - not FAILED - because the
-     * processor may have charged the card after we stopped listening.
+     * Today's "done": a bounded error at our own deadline, one attempt recorded as TIMEOUT, not
+     * FAILURE. A timeout is not a decline, so the payment stays PROCESSING - the processor may have
+     * charged the card after we stopped listening. And no retry: the timeout used up the budget.
      */
     @Test
-    void processorTimeoutLeavesThePaymentProcessingNotFailed() throws Exception {
+    void processorTimeoutIsABounded504AndTheAttemptIsTimeoutNotFailure() throws Exception {
         // Past the test profile's 1 s read timeout.
         processor.approveAfter(Duration.ofSeconds(3));
+        int callsBefore = processor.requestBodies().size();
 
+        long started = System.nanoTime();
         String body = mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
-                .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.status").value("PROCESSING"))
+                .andExpect(status().isGatewayTimeout())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.title").value("Payment outcome unknown"))
+                .andExpect(jsonPath("$.detail").value(containsString("Do not create a new payment")))
+                .andExpect(header().exists("Location"))
                 .andReturn().getResponse().getContentAsString();
-        UUID id = UUID.fromString(JsonPath.read(body, "$.id"));
+        // We gave up at our deadline (~1 s), not when the processor finished (3 s).
+        assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofMillis(2500));
+        UUID id = UUID.fromString(JsonPath.read(body, "$.paymentId"));
 
         assertThat(jdbc.queryForObject("SELECT status FROM payments WHERE id = ?", String.class, id))
                 .isEqualTo("PROCESSING");
@@ -217,8 +225,68 @@ class PaymentControllerIT {
         assertThat(attempt)
                 .containsEntry("outcome", "TIMEOUT")
                 .containsEntry("error_code", "READ_TIMEOUT");
-        // We gave up at our deadline (~1 s), not when the processor finished (3 s).
         assertThat((Integer) attempt.get("latency_ms")).isBetween(900, 2500);
+        assertThat(processor.requestBodies()).hasSize(callsBefore + 1);
+    }
+
+    @Test
+    void retryWithTheSameKeyAfterATimeoutGetsThe504AgainAndNeverCallsTheProcessor() throws Exception {
+        String key = "key-" + UUID.randomUUID();
+        processor.approveAfter(Duration.ofSeconds(3));
+        String first = mockMvc.perform(post("/payments")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_BODY))
+                .andExpect(status().isGatewayTimeout())
+                .andReturn().getResponse().getContentAsString();
+        processor.approveAll();
+        int callsBefore = processor.requestBodies().size();
+
+        String replay = mockMvc.perform(post("/payments")
+                        .header("Idempotency-Key", key)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_BODY))
+                .andExpect(status().isGatewayTimeout())
+                .andExpect(header().string("Idempotent-Replayed", "true"))
+                .andReturn().getResponse().getContentAsString();
+
+        assertThat(replay).isEqualTo(first);
+        assertThat(processor.requestBodies()).hasSize(callsBefore);
+    }
+
+    /**
+     * The retry, for real: each call its own attempt row, and every call the same request id, which
+     * is what makes retrying after a broken connection safe at a processor that deduplicates.
+     */
+    @Test
+    void brokenConnectionsAreRetriedWithTheSameRequestIdAndARowPerCall() throws Exception {
+        processor.breakNextConnections(2);
+        int callsBefore = processor.requestBodies().size();
+
+        String body = mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("AUTHORIZED"))
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(JsonPath.read(body, "$.id"));
+
+        assertThat(jdbc.queryForList(
+                        "SELECT outcome FROM payment_attempts WHERE payment_id = ? ORDER BY attempt_number",
+                        String.class, id))
+                .containsExactly("UNKNOWN", "UNKNOWN", "SUCCESS");
+        List<String> calls = processor.requestBodies();
+        assertThat(calls.subList(callsBefore, calls.size()))
+                .hasSize(3)
+                .allSatisfy(call -> assertThat(call).contains("\"requestId\":\"authorize:" + id + "\""));
+    }
+
+    @Test
+    void aDeclineIsNeverRetried() throws Exception {
+        processor.declineAll("INSUFFICIENT_FUNDS");
+        int callsBefore = processor.requestBodies().size();
+
+        createPayment();
+
+        assertThat(processor.requestBodies()).hasSize(callsBefore + 1);
     }
 
     @Test

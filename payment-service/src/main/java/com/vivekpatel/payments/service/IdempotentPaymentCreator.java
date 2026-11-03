@@ -6,11 +6,13 @@ import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.domain.PaymentStatus;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -60,6 +62,8 @@ public class IdempotentPaymentCreator {
      * call to the processor.
      *
      * @throws IdempotencyKeyReusedException if the key was used before with a different request.
+     * @throws PaymentOutcomeUnknownException if the processor gave no usable answer, on this call
+     *     or on the earlier one being replayed. The payment exists and stays {@code PROCESSING}.
      */
     public CreatePaymentResult create(
             String merchantId,
@@ -96,11 +100,19 @@ public class IdempotentPaymentCreator {
                         idempotencyKey, original.id(),
                         differingFields(original, amount, externalReference));
             }
+            // The first call got a 504, so a retry gets the same. A 200 here would read as success.
+            if (Integer.valueOf(HttpStatus.GATEWAY_TIMEOUT.value()).equals(stored.getResponseStatus())) {
+                throw new PaymentOutcomeUnknownException(original.id(), true);
+            }
             return new CreatePaymentResult.Replayed(original);
         }
         // Outside the try: a failure while authorising is not a duplicate key, whatever it is.
         // And after create's transaction has committed, so the processor call holds no connection.
-        return new CreatePaymentResult.Created(authorizer.authorize(created.getId(), idempotencyKey));
+        Payment authorized = authorizer.authorize(created.getId(), idempotencyKey);
+        if (authorized.getStatus() == PaymentStatus.PROCESSING) {
+            throw new PaymentOutcomeUnknownException(authorized.getId(), false);
+        }
+        return new CreatePaymentResult.Created(authorized);
     }
 
     /**

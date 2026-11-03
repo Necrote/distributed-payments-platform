@@ -27,6 +27,7 @@ import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.IdempotentPaymentCreator;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
+import com.vivekpatel.payments.service.PaymentOutcomeUnknownException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -306,6 +307,31 @@ class PaymentControllerTest {
         mockMvc.perform(post("/payments/{id}/refund", payment.getId()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("REFUND_PENDING"));
+    }
+
+    @Test
+    void unknownOutcomeIs504NamingThePaymentAndTellingTheClientNotToPayAgain() throws Exception {
+        UUID id = UUID.randomUUID();
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new PaymentOutcomeUnknownException(id, false));
+
+        mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isGatewayTimeout())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.paymentId").value(id.toString()))
+                .andExpect(jsonPath("$.detail").value(containsString("Do not create a new payment")))
+                .andExpect(header().string("Location", "/payments/" + id))
+                .andExpect(header().doesNotExist(PaymentController.REPLAYED_HEADER));
+    }
+
+    @Test
+    void aReplayedUnknownOutcomeSaysItIsAReplay() throws Exception {
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new PaymentOutcomeUnknownException(UUID.randomUUID(), true));
+
+        mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isGatewayTimeout())
+                .andExpect(header().string(PaymentController.REPLAYED_HEADER, "true"));
     }
 
     @Test

@@ -14,6 +14,7 @@ import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.domain.PaymentStatus;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Duration;
@@ -50,6 +51,40 @@ class IdempotentPaymentCreatorTest {
         assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
                 .isEqualTo(new CreatePaymentResult.Created(authorized));
         verify(service, never()).findIdempotencyKey(any(), any());
+    }
+
+    @Test
+    void aPaymentLeftProcessingIsAnUnknownOutcomeNotACreated() {
+        Payment created = payment();
+        Payment processing = payment();
+        processing.transitionTo(PaymentStatus.PROCESSING, FIXED);
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenReturn(created);
+        when(authorizer.authorize(created.getId(), KEY)).thenReturn(processing);
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(PaymentOutcomeUnknownException.class, e -> {
+                    assertThat(e.getPaymentId()).isEqualTo(processing.getId());
+                    assertThat(e.isReplayed()).isFalse();
+                });
+    }
+
+    @Test
+    void replayingAnUnknownOutcomeRepeatsItRatherThanReportingSuccess() throws Exception {
+        Payment original = payment();
+        original.transitionTo(PaymentStatus.PROCESSING, FIXED);
+        IdempotencyKey stored = IdempotencyKey.claim(
+                "m-1", KEY, PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", "ref"),
+                Duration.ofHours(24), FIXED);
+        stored.recordResponse(original.getId(), 504, mapper.writeValueAsString(PaymentResponse.from(original)));
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(PaymentOutcomeUnknownException.class, e -> {
+                    assertThat(e.getPaymentId()).isEqualTo(original.getId());
+                    assertThat(e.isReplayed()).isTrue();
+                });
+        verify(authorizer, never()).authorize(any(), any());
     }
 
     @Test

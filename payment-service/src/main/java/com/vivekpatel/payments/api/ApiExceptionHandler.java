@@ -4,7 +4,9 @@ import com.fasterxml.jackson.databind.JsonMappingException;
 import com.vivekpatel.payments.domain.IllegalStateTransitionException;
 import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
+import com.vivekpatel.payments.service.PaymentOutcomeUnknownException;
 import jakarta.servlet.http.HttpServletRequest;
+import java.net.URI;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
@@ -162,6 +164,29 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         body.setProperty("originalPaymentId", ex.getOriginalPaymentId());
         body.setProperty("differingFields", ex.getDifferingFields());
         return body;
+    }
+
+    /**
+     * The processor gave no usable answer, so the payment's outcome is unknown. 504 with the payment
+     * id, and a detail that says what to do, because the dangerous reaction to an error here is to
+     * pay again while the first charge may exist. A retry with the same key is safe and gets this
+     * answer again.
+     */
+    @ExceptionHandler(PaymentOutcomeUnknownException.class)
+    public ResponseEntity<ProblemDetail> handleOutcomeUnknown(PaymentOutcomeUnknownException ex) {
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.GATEWAY_TIMEOUT,
+                "The payment processor did not give a usable answer, so payment " + ex.getPaymentId()
+                        + " may or may not have been charged. Do not create a new payment. Fetch this "
+                        + "one to see its current status.");
+        body.setTitle("Payment outcome unknown");
+        body.setProperty("paymentId", ex.getPaymentId());
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT)
+                .location(URI.create("/payments/" + ex.getPaymentId()));
+        if (ex.isReplayed()) {
+            response.header(PaymentController.REPLAYED_HEADER, "true");
+        }
+        return response.body(body);
     }
 
     /**
