@@ -134,7 +134,8 @@ retry loop is how a loser fights a legitimate winner for a second capture.
   flight, outcome unknown". A processor timeout or `5xx` does *not* move it to `FAILED`, because a
   timeout isn't a decline: the charge may exist. `AttemptOutcome.paymentStatusAfterAuthorization`
   holds that rule, and `PaymentControllerIT` proves it for a timeout. But the payment then waits for
-  a retry or reconciliation, and neither is built, so today it stays `PROCESSING`.
+  reconciliation, which isn't built, so today it stays `PROCESSING`. Retries don't get it out: a read
+  timeout uses up the retry deadline, and a `5xx` isn't retried. Only a broken connection is retried.
 - **The loser of a race has to look before it retries.** Clients must treat a `409` as "fetch the
   payment, then decide". A client that blindly retries on `409` will just get another `409`. That's
   safe, but it needs to be in the API documentation.
@@ -149,5 +150,5 @@ retry loop is how a loser fights a legitimate winner for a second capture.
 | Concurrent update → `409`, not retried | Built, tested (20-run HTTP race, deterministic twin) |
 | CHECK constraint on known statuses | Built (`V1__core_schema.sql`) |
 | Timeout or `5xx` leaves the payment `PROCESSING`, never `FAILED` | Built, tested (`PaymentControllerIT`, `PaymentAttemptTest`) |
-| Leaving `PROCESSING` after an unknown outcome (retry, reconciliation), refund confirmation | Phase 3 |
+| Leaving `PROCESSING` after an unknown outcome (reconciliation), refund confirmation | Phase 3 |
 | Refund race test | Not yet: same code path as capture, not separately proven |

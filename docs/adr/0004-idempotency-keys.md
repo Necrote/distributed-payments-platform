@@ -32,7 +32,9 @@ Three things have to be true at once:
 - **The stored response is rewritten once, when authorisation finishes.** The processor call runs
   after the create transaction, so the first response isn't known until then. The transaction that
   records the attempt's outcome also stores the response the request is about to return. After that
-  the row never changes, and a replay never calls the processor.
+  the row never changes, and a replay never calls the processor. If the outcome is unknown, the
+  stored status is `504` and a replay repeats that `504` rather than a `200`, which would read as
+  success.
 - A duplicate-key violation on that constraint is the replay path, not an error path. It is caught
   **outside** the failed transaction (`IdempotentPaymentCreator`, `Propagation.NEVER`), and the stored
   row is read in a new read-only transaction. Then:
@@ -190,3 +192,7 @@ described them.
 together, but the first response now depends on a call made after that commit. So the stored response
 is rewritten when authorisation finishes, and two new gaps are recorded under "What this makes hard":
 the snapshot a retry gets during the call, and the replay a crash can freeze.
+
+**2026-11-02.** An unknown outcome now answers `504` instead of `201`, so the stored status records
+it and a replay repeats the `504`, with `Idempotent-Replayed: true`. The replay can stay `504` after
+the payment has moved on, for the reason in "Replay shows the past, not the present".
