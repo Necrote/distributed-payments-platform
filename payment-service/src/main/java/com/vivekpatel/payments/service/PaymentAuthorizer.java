@@ -7,6 +7,9 @@ import com.vivekpatel.payments.processor.AuthorizeRequest;
 import com.vivekpatel.payments.processor.ProcessorClient;
 import com.vivekpatel.payments.processor.ProcessorException;
 import com.vivekpatel.payments.processor.ProcessorProperties;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryRegistry;
 import io.github.resilience4j.timelimiter.TimeLimiterRegistry;
@@ -50,6 +53,12 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>Resilience4j's {@link Retry.Context} is driven by hand rather than through a decorator or
  * annotation, because each attempt writes its own row between calls and the deadline has to be
  * checked between attempts.
+ *
+ * <p><b>Every call also goes through the circuit breaker</b>, inside the retry, so each attempt is
+ * one call the breaker sees. When it is open, a call is refused locally: nothing is sent, so the
+ * attempt is a {@code FAILURE} with {@code CIRCUIT_OPEN} and is not retried. Usually the caller has
+ * already refused the request before creating anything (see {@link #processorIsRejectingCalls()});
+ * this path is only reached if the breaker opens between that check and the call.
  */
 @Service
 @Transactional(propagation = Propagation.NEVER)
@@ -60,6 +69,7 @@ public class PaymentAuthorizer {
     private final PaymentApplicationService payments;
     private final ProcessorClient processor;
     private final Retry retry;
+    private final CircuitBreaker circuitBreaker;
     private final Duration longestCall;
     private final Duration totalDeadline;
 
@@ -68,10 +78,12 @@ public class PaymentAuthorizer {
             ProcessorClient processor,
             RetryRegistry retries,
             TimeLimiterRegistry timeLimiters,
+            CircuitBreakerRegistry circuitBreakers,
             ProcessorProperties properties) {
         this.payments = payments;
         this.processor = processor;
         this.retry = retries.retry("processor");
+        this.circuitBreaker = circuitBreakers.circuitBreaker("processor");
         this.longestCall = timeLimiters.timeLimiter("processor").getTimeLimiterConfig().getTimeoutDuration();
         this.totalDeadline = properties.totalDeadline();
     }
@@ -100,7 +112,7 @@ public class PaymentAuthorizer {
             AttemptResult result;
             ProcessorException failure = null;
             try {
-                result = resultOf(processor.authorize(request));
+                result = resultOf(callThroughBreaker(request));
                 retryContext.onComplete();
             } catch (ProcessorException e) {
                 result = resultOf(e);
@@ -117,6 +129,35 @@ public class PaymentAuthorizer {
             }
             payments.recordFailedAttempt(attemptId, result, latency);
             attemptId = payments.startNextAttempt(paymentId);
+        }
+    }
+
+    /**
+     * Whether the breaker is refusing calls right now. Checked before a payment is created, so an
+     * open breaker fails the request fast and creates nothing. A {@code HALF_OPEN} breaker is not
+     * refusing: it needs calls to find out whether the processor is back.
+     */
+    public boolean processorIsRejectingCalls() {
+        CircuitBreaker.State state = circuitBreaker.getState();
+        return state == CircuitBreaker.State.OPEN || state == CircuitBreaker.State.FORCED_OPEN;
+    }
+
+    /** How long an open breaker waits before probing: the honest upper bound for a Retry-After. */
+    public Duration processorRetryAfter() {
+        return Duration.ofMillis(
+                circuitBreaker.getCircuitBreakerConfig().getWaitIntervalFunctionInOpenState().apply(1));
+    }
+
+    /**
+     * A decline returns normally, so the breaker records it as a success, which it is. Only the
+     * exceptions configured under {@code recordExceptions} count against the processor.
+     */
+    private AuthorizationDecision callThroughBreaker(AuthorizeRequest request) {
+        try {
+            return circuitBreaker.executeSupplier(() -> processor.authorize(request));
+        } catch (CallNotPermittedException e) {
+            // Refused here, before anything was sent: certainly no money moved.
+            throw new ProcessorException.NotProcessed("CIRCUIT_OPEN", e);
         }
     }
 

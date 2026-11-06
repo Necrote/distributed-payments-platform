@@ -19,3 +19,9 @@ resilience4j:
     instances:
       processor:
         waitDuration: 20ms
+  circuitbreaker:
+    instances:
+      processor:
+        # Only the wait is shortened, so a lifecycle test doesn't sleep for 10s. The window and
+        # thresholds stay production values: those are what the tests are there to check.
+        waitDurationInOpenState: 500ms

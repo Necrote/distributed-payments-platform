@@ -15,6 +15,7 @@ import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.domain.PaymentStatus;
 import com.vivekpatel.payments.persistence.PaymentRepository;
 import com.vivekpatel.payments.processor.FakeProcessor;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -86,9 +87,15 @@ class PaymentControllerIT {
         registry.add("payments.processor.base-url", processor::baseUrl);
     }
 
+    @Autowired
+    CircuitBreakerRegistry circuitBreakers;
+
     @AfterEach
     void processorBackToApproving() {
         processor.approveAll();
+        // The breaker lives as long as the Spring context, which the tests share. Several tests
+        // here fail calls on purpose, and they must not add up to an open breaker for the next.
+        circuitBreakers.circuitBreaker("processor").reset();
     }
 
     @AfterAll

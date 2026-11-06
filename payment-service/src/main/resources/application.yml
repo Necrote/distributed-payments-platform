@@ -53,7 +53,9 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,prometheus,flyway
+        # circuitbreakers: current state of each breaker; circuitbreakerevents: its recent
+        # transitions and recorded calls, which is how the breaker's lifecycle can be narrated.
+        include: health,info,metrics,prometheus,flyway,circuitbreakers,circuitbreakerevents
   endpoint:
     health:
       show-details: when-authorized
@@ -107,23 +109,51 @@ resilience4j:
         # Our own types, not IOException and TimeoutException as first drafted: ProcessorClient
         # translates those, so they would never match and nothing would ever retry. Everything
         # unlisted is final: declines are not exceptions at all, a 4xx would get the same answer,
-        # and a 5xx is left for the circuit breaker (Day 16).
+        # and a 5xx is left for the circuit breaker.
         retryExceptions:
           - com.vivekpatel.payments.processor.ProcessorException$ConnectFailed
           - com.vivekpatel.payments.processor.ProcessorException$TimedOut
           - com.vivekpatel.payments.processor.ProcessorException$ConnectionBroken
+  # Every value below is argued in docs/adr/0008-circuit-breaker-thresholds.md, with the numbers.
+  # In short: at a realistic 5% background error rate this never opens (0 trips in a simulated
+  # million calls), and against a dead processor it opens after 10 calls.
+  circuitbreaker:
+    instances:
+      processor:
+        # Count, not time: this service's traffic is low and uneven, so a time window would hold
+        # a handful of calls one minute and none the next.
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 20
+        # Never judge on fewer than 10. Resilience4j's default is 100, which at our traffic means
+        # a dead processor would take 100 failed calls (about 50 failed payments) to notice.
+        minimumNumberOfCalls: 10
+        # Half the window failing. Real outages fail close to 100% of calls; background noise is
+        # around 5%. 50% sits far from both. 25% already trips 426 times per million at 5%.
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        # Three probes, and at most one may fail, before trusting the processor again.
+        permittedNumberOfCallsInHalfOpenState: 3
+        # Without this the breaker only leaves OPEN when a call arrives - and the fail-fast check
+        # before creating a payment means none ever would. It would stay open forever.
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        # What counts as the processor failing. Anything that could mean it is broken or
+        # overloaded; nothing that is it working.
+        recordExceptions:
+          - com.vivekpatel.payments.processor.ProcessorException$ConnectFailed
+          - com.vivekpatel.payments.processor.ProcessorException$TimedOut
+          - com.vivekpatel.payments.processor.ProcessorException$ConnectionBroken
+          - com.vivekpatel.payments.processor.ProcessorException$OutcomeUnknown
+        # A 4xx (including 429) is neither: it says nothing about the processor's health either
+        # way. Declines are not exceptions, so they count as successes, which is what they are.
+        ignoreExceptions:
+          - com.vivekpatel.payments.processor.ProcessorException$NotProcessed
+        # Off, deliberately. With it on, an open breaker makes /actuator/health DOWN, and an
+        # orchestrator restarts or unrolls every instance because one dependency is down.
+        registerHealthIndicator: false
 
-# Phase 3 (Day 16-17). Left commented so this file does not claim resilience it has not
-# demonstrated; the guide switches these on one at a time, each with a failure scenario.
+# Phase 3 (Day 17). Left commented so this file does not claim resilience it has not
+# demonstrated; the guide switches it on with its own failure scenario.
 # resilience4j:
-#   circuitbreaker:
-#     instances:
-#       processor:
-#         slidingWindowType: COUNT_BASED
-#         slidingWindowSize: 20
-#         failureRateThreshold: 50
-#         waitDurationInOpenState: 10s
-#         permittedNumberOfCallsInHalfOpenState: 3
 #   bulkhead:
 #     instances:
 #       processor:

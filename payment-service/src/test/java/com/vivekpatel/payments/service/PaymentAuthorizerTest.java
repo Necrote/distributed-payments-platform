@@ -18,6 +18,9 @@ import com.vivekpatel.payments.processor.AuthorizeRequest;
 import com.vivekpatel.payments.processor.ProcessorClient;
 import com.vivekpatel.payments.processor.ProcessorException;
 import com.vivekpatel.payments.processor.ProcessorProperties;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.retry.RetryConfig;
 import io.github.resilience4j.retry.RetryRegistry;
 import io.github.resilience4j.timelimiter.TimeLimiterConfig;
@@ -44,6 +47,12 @@ class PaymentAuthorizerTest {
     private static final UUID SECOND_ATTEMPT = UUID.randomUUID();
     private static final UUID THIRD_ATTEMPT = UUID.randomUUID();
 
+    // Ignores NotProcessed like production, so CIRCUIT_OPEN and 4xx never count; a fresh registry
+    // per test, so one test's failures never open another's breaker.
+    private final CircuitBreakerRegistry breakers = CircuitBreakerRegistry.of(CircuitBreakerConfig.custom()
+            .waitDurationInOpenState(Duration.ofSeconds(7))
+            .ignoreExceptions(ProcessorException.NotProcessed.class)
+            .build());
     private final PaymentApplicationService payments = mock(PaymentApplicationService.class);
     private final ProcessorClient processor = mock(ProcessorClient.class);
     private final Payment payment = Payment.create("m-1", Money.of(12500, "INR"), "tok_test_123", null, FIXED);
@@ -199,6 +208,50 @@ class PaymentAuthorizerTest {
         verify(payments, never()).startNextAttempt(any());
     }
 
+    @Test
+    void anOpenBreakerRefusesLocallySoNothingIsSentAndNothingRetried() {
+        breakers.circuitBreaker("processor").transitionToOpenState();
+
+        authorizer.authorize(payment.getId(), null);
+
+        verify(processor, never()).authorize(any());
+        verifyCompletedOnFirstAttempt(new AttemptResult(AttemptOutcome.FAILURE, null, "CIRCUIT_OPEN"));
+    }
+
+    @Test
+    void onlyAnOpenBreakerRejectsCallsBecauseHalfOpenNeedsCallsToProbe() {
+        CircuitBreaker breaker = breakers.circuitBreaker("processor");
+        assertThat(authorizer.processorIsRejectingCalls()).isFalse();
+
+        breaker.transitionToOpenState();
+        assertThat(authorizer.processorIsRejectingCalls()).isTrue();
+
+        breaker.transitionToHalfOpenState();
+        assertThat(authorizer.processorIsRejectingCalls()).isFalse();
+
+        breaker.transitionToForcedOpenState();
+        assertThat(authorizer.processorIsRejectingCalls()).isTrue();
+    }
+
+    @Test
+    void retryAfterIsTheOpenStateWait() {
+        assertThat(authorizer.processorRetryAfter()).isEqualTo(Duration.ofSeconds(7));
+    }
+
+    @Test
+    void aDeclineCountsAsASuccessForTheBreakerAndAFailureAsAFailure() {
+        when(processor.authorize(request))
+                .thenReturn(new AuthorizationDecision.Declined("INSUFFICIENT_FUNDS"))
+                .thenThrow(new ProcessorException.OutcomeUnknown("HTTP_500", null));
+
+        authorizer.authorize(payment.getId(), null);
+        authorizer.authorize(payment.getId(), null);
+
+        CircuitBreaker.Metrics metrics = breakers.circuitBreaker("processor").getMetrics();
+        assertThat(metrics.getNumberOfSuccessfulCalls()).isOne();
+        assertThat(metrics.getNumberOfFailedCalls()).isOne();
+    }
+
     private void verifyCompletedOnFirstAttempt(AttemptResult expected) {
         verify(payments).completeAuthorization(eq(FIRST_ATTEMPT), eq(expected), any(), isNull());
         verify(payments, never()).recordFailedAttempt(any(), any(), any());
@@ -223,6 +276,7 @@ class PaymentAuthorizerTest {
                 processor,
                 RetryRegistry.of(retry),
                 TimeLimiterRegistry.of(limiter),
+                breakers,
                 new ProcessorProperties("http://unused", Duration.ofMillis(100), Duration.ofMillis(500), totalDeadline));
     }
 }
