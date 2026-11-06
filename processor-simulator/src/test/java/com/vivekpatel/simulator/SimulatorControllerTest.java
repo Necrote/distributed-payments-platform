@@ -54,6 +54,25 @@ class SimulatorControllerTest {
     }
 
     @Test
+    void intermittentFailsAtTheRateItWasGiven() throws Exception {
+        mockMvc.perform(put("/control/mode").param("mode", "INTERMITTENT").param("failureRate", "1.0"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.intermittentFailureRate").value(1.0));
+        authorize().andExpect(status().isInternalServerError());
+
+        mockMvc.perform(put("/control/mode").param("mode", "INTERMITTENT").param("failureRate", "0"))
+                .andExpect(status().isOk());
+        authorize().andExpect(status().isOk());
+    }
+
+    @Test
+    void aFailureRateOutsideZeroToOneIsA400AndChangesNothing() throws Exception {
+        mockMvc.perform(put("/control/mode").param("mode", "INTERMITTENT").param("failureRate", "5"))
+                .andExpect(status().isBadRequest());
+        assertThat(properties.getMode()).isEqualTo(FailureMode.NORMAL);
+    }
+
+    @Test
     void aRepeatedRequestIdGetsTheSameAuthorizationInsteadOfASecondOne() throws Exception {
         // What makes a caller's retry safe: without this, retrying after a broken connection would
         // really authorise twice here.

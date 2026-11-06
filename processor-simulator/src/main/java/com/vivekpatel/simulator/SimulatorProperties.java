@@ -31,8 +31,11 @@ public class SimulatorProperties {
     /** How long {@link FailureMode#TIMEOUT} sleeps before giving up on responding at all. */
     private Duration timeoutLatency = Duration.ofSeconds(60);
 
-    /** Fraction of calls that fail in {@link FailureMode#INTERMITTENT}, from 0.0 to 1.0. */
-    private double intermittentFailureRate = 0.3;
+    /**
+     * Fraction of calls that fail in {@link FailureMode#INTERMITTENT}, from 0.0 to 1.0. Volatile for
+     * the same reason as {@code mode}: the control endpoint changes it at runtime.
+     */
+    private volatile double intermittentFailureRate = 0.3;
 
     /** How long {@link FailureMode#OUTAGE} refuses calls before recovering on its own. */
     private Duration outageDuration = Duration.ofSeconds(30);

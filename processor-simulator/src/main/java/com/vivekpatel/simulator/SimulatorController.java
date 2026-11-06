@@ -80,7 +80,11 @@ public class SimulatorController {
             case HTTP_429 -> ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                     .header(HttpHeaders.RETRY_AFTER, String.valueOf(RETRY_AFTER_SECONDS))
                     .body(error(request, "RATE_LIMITED"));
-            case INTERMITTENT, DUPLICATE_RESPONSE, OUTAGE -> ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED)
+            // Background noise: the fraction that fails is a 500, the rest behave like NORMAL.
+            case INTERMITTENT -> ThreadLocalRandom.current().nextDouble() < properties.getIntermittentFailureRate()
+                    ? ResponseEntity.internalServerError().body(error(request, "PROCESSOR_ERROR"))
+                    : sleepThenAuthorize(properties.getBaseLatency(), request);
+            case DUPLICATE_RESPONSE, OUTAGE -> ResponseEntity.status(HttpStatus.NOT_IMPLEMENTED)
                     .body(error(request, "MODE_NOT_IMPLEMENTED"));
         };
     }
@@ -119,9 +123,21 @@ public class SimulatorController {
      * leave the processor in NORMAL and produce a green run that proved nothing.
      */
     @PutMapping("/control/mode")
-    public Map<String, Object> setMode(@RequestParam FailureMode mode) {
+    public ResponseEntity<Map<String, Object>> setMode(
+            @RequestParam FailureMode mode, @RequestParam(required = false) Double failureRate) {
+        // Optional, and only for INTERMITTENT: '...?mode=INTERMITTENT&failureRate=0.05'. Rejected
+        // when out of range, for the same reason as an unknown mode.
+        if (failureRate != null) {
+            if (failureRate < 0.0 || failureRate > 1.0) {
+                return ResponseEntity.badRequest().body(Map.of("error", "failureRate must be between 0 and 1"));
+            }
+            properties.setIntermittentFailureRate(failureRate);
+        }
         properties.setMode(mode);
-        return Map.of("mode", mode.name(), "description", mode.description());
+        return ResponseEntity.ok(Map.of(
+                "mode", mode.name(),
+                "description", mode.description(),
+                "intermittentFailureRate", properties.getIntermittentFailureRate()));
     }
 
     /** TODO Phase 3 (Day 17): reset counters, clear the in-memory stores, mode=NORMAL. */
