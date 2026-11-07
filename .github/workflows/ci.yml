@@ -62,7 +62,7 @@ jobs:
 
   # -------------------------------------------------------------------------------------------
   # Mutation testing. Enabled Day 11, after measuring: 91/121 mutants killed (75%). Raised since as
-  # the score rose, now 84 after measuring 158/187; the history is in payment-service/pom.xml. The gate
+  # the score rose, now 85 after measuring 172/202; the history is in payment-service/pom.xml. The gate
   # fails this job if the score drops. Proven locally before trusting it: disabling one test
   # (PaymentTest's illegal-transition check) took the score to 74 and failed the build. A
   # threshold invented before the first measurement is theatre.
