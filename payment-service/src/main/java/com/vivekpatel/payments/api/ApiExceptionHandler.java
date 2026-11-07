@@ -5,6 +5,7 @@ import com.vivekpatel.payments.domain.IllegalStateTransitionException;
 import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import com.vivekpatel.payments.service.PaymentOutcomeUnknownException;
+import com.vivekpatel.payments.service.ProcessorUnavailableException;
 import jakarta.servlet.http.HttpServletRequest;
 import java.net.URI;
 import java.util.Comparator;
@@ -187,6 +188,23 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
             response.header(PaymentController.REPLAYED_HEADER, "true");
         }
         return response.body(body);
+    }
+
+    /**
+     * The circuit breaker is open. 503 with {@code Retry-After}, and a detail that says the two
+     * things a client needs: nothing was created or charged, and the same key is safe to retry.
+     */
+    @ExceptionHandler(ProcessorUnavailableException.class)
+    public ResponseEntity<ProblemDetail> handleProcessorUnavailable(ProcessorUnavailableException ex) {
+        long seconds = Math.max(1, (ex.getRetryAfter().toMillis() + 999) / 1000);
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                "The payment processor is unavailable, so no payment was created and nothing was "
+                        + "charged. Retry after " + seconds + " seconds with the same Idempotency-Key.");
+        body.setTitle("Payment processor unavailable");
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, String.valueOf(seconds))
+                .body(body);
     }
 
     /**

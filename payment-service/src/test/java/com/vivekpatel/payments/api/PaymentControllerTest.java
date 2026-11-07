@@ -28,6 +28,7 @@ import com.vivekpatel.payments.service.IdempotentPaymentCreator;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import com.vivekpatel.payments.service.PaymentOutcomeUnknownException;
+import com.vivekpatel.payments.service.ProcessorUnavailableException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -322,6 +323,21 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.detail").value(containsString("Do not create a new payment")))
                 .andExpect(header().string("Location", "/payments/" + id))
                 .andExpect(header().doesNotExist(PaymentController.REPLAYED_HEADER));
+    }
+
+    @Test
+    void anOpenBreakerIs503WithRetryAfterAndSaysNothingWasCharged() throws Exception {
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new ProcessorUnavailableException(java.time.Duration.ofMillis(9500)));
+
+        mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                // Rounded up: telling a client to come back early only earns it another 503.
+                .andExpect(header().string("Retry-After", "10"))
+                .andExpect(jsonPath("$.title").value("Payment processor unavailable"))
+                .andExpect(jsonPath("$.detail").value(containsString("nothing was charged")))
+                .andExpect(jsonPath("$.detail").value(containsString("same Idempotency-Key")));
     }
 
     @Test

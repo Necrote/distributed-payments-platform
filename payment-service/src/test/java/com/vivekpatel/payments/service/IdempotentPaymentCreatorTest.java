@@ -54,6 +54,43 @@ class IdempotentPaymentCreatorTest {
     }
 
     @Test
+    void anOpenBreakerFailsFastAndCreatesNothing() {
+        when(authorizer.processorIsRejectingCalls()).thenReturn(true);
+        when(authorizer.processorRetryAfter()).thenReturn(Duration.ofSeconds(10));
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(ProcessorUnavailableException.class,
+                        e -> assertThat(e.getRetryAfter()).isEqualTo(Duration.ofSeconds(10)));
+        verify(service, never()).create(any(), any(), any(), any(), any());
+        verify(authorizer, never()).authorize(any(), any());
+    }
+
+    @Test
+    void anOpenBreakerFailsFastWithoutAKeyToo() {
+        when(authorizer.processorIsRejectingCalls()).thenReturn(true);
+        when(authorizer.processorRetryAfter()).thenReturn(Duration.ofSeconds(10));
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", null))
+                .isInstanceOf(ProcessorUnavailableException.class);
+        verify(service, never()).create(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void anOpenBreakerStillReplaysAKeyThatWasAlreadyUsed() throws Exception {
+        // A replay needs no processor, so refusing it would turn a success into an error.
+        Payment original = payment();
+        IdempotencyKey stored = storedKey(
+                PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", "ref"), original);
+        when(authorizer.processorIsRejectingCalls()).thenReturn(true);
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
+
+        assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isEqualTo(new CreatePaymentResult.Replayed(PaymentResponse.from(original)));
+    }
+
+    @Test
     void aPaymentLeftProcessingIsAnUnknownOutcomeNotACreated() {
         Payment created = payment();
         Payment processing = payment();

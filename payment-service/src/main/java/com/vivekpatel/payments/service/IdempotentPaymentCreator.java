@@ -64,6 +64,8 @@ public class IdempotentPaymentCreator {
      * @throws IdempotencyKeyReusedException if the key was used before with a different request.
      * @throws PaymentOutcomeUnknownException if the processor gave no usable answer, on this call
      *     or on the earlier one being replayed. The payment exists and stays {@code PROCESSING}.
+     * @throws ProcessorUnavailableException if the circuit breaker is open and this would be a new
+     *     payment. Nothing is created, so a retry with the same key works once it closes.
      */
     public CreatePaymentResult create(
             String merchantId,
@@ -71,6 +73,13 @@ public class IdempotentPaymentCreator {
             String paymentMethodToken,
             String externalReference,
             String idempotencyKey) {
+        // Fail fast, and before writing anything: a payment created now could only end FAILED, and
+        // its key would then replay that failure forever. A replay needs no processor, so a key
+        // that already exists goes on to be replayed as usual.
+        if (authorizer.processorIsRejectingCalls()
+                && (idempotencyKey == null || payments.findIdempotencyKey(merchantId, idempotencyKey).isEmpty())) {
+            throw new ProcessorUnavailableException(authorizer.processorRetryAfter());
+        }
         Payment created;
         try {
             created = payments.create(

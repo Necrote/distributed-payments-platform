@@ -94,6 +94,13 @@ public class PaymentController {
                     mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
                     schema = @Schema(implementation = ProblemDetail.class)))
     @ApiResponse(
+            responseCode = "503",
+            description = "The processor's circuit breaker is open. Nothing was created or charged; "
+                    + "retry after `Retry-After` seconds with the same Idempotency-Key",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @ApiResponse(
             responseCode = "504",
             description = "The processor gave no usable answer, so the payment may or may not be "
                     + "charged. Names the `paymentId`: fetch it, and do not create a new payment",
