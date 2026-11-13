@@ -117,6 +117,17 @@ class ProcessorClientTest {
     }
 
     @Test
+    void aBodyCutOffMidwayIsABrokenConnectionNotAMalformedAnswer() {
+        // The processor's DUPLICATE_RESPONSE: the answer starts arriving, then the connection goes.
+        // Retryable with the same request id - unlike a body that arrived whole and made no sense.
+        processor.cutOffNextBodies(1);
+
+        assertThatThrownBy(() -> client.authorize(request))
+                .isInstanceOfSatisfying(ProcessorException.ConnectionBroken.class,
+                        e -> assertThat(e.errorCode()).isEqualTo("IO_ERROR"));
+    }
+
+    @Test
     void aConnectionThatBreaksAfterSendingIsBrokenNotRefused() {
         // Not ConnectFailed: the request went out, so the charge may exist.
         processor.breakNextConnections(1);

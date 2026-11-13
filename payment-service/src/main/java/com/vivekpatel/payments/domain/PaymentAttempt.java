@@ -18,7 +18,13 @@ import java.util.UUID;
 import org.springframework.data.domain.Persistable;
 
 /**
- * One row in {@code payment_attempts}: one call to the processor, and what came of it.
+ * One row in {@code payment_attempts}: one request id sent to the processor, and what came of it.
+ *
+ * <p><b>One row per request id, not per call.</b> A retry sends the same request id, which the
+ * processor treats as the same authorisation, so it is the same attempt: the retry counts the call
+ * on this row ({@link #recordAnotherCall()}) rather than adding a row. The schema enforces it with a
+ * unique (payment, operation, request id). A duplicated answer therefore cannot become a second
+ * attempt, and one authorisation is never recorded as two (V3 migration).
  *
  * <p>Written <b>before</b> the call, as {@link AttemptOutcome#PENDING}, in its own committed
  * transaction; completed after. That order is the whole design. If the process dies mid-call, the
@@ -59,6 +65,15 @@ public class PaymentAttempt implements Persistable<UUID> {
     @Column(name = "error_code")
     private String errorCode;
 
+    /** The idempotency key sent to the processor. One row per value, per payment and operation. */
+    @Column(name = "processor_request_id", nullable = false, updatable = false)
+    private String processorRequestId;
+
+    /** Calls made with this request id, retries included. */
+    @Column(name = "call_count", nullable = false)
+    private int callCount;
+
+    /** How long the last call took. */
     @Column(name = "latency_ms")
     private Integer latencyMs;
 
@@ -73,11 +88,16 @@ public class PaymentAttempt implements Persistable<UUID> {
     protected PaymentAttempt() {
     }
 
-    /** A new attempt, about to be made. */
+    /** A new attempt, about to make its first call. */
     public static PaymentAttempt start(
-            UUID paymentId, int attemptNumber, AttemptOperation operation, Clock clock) {
+            UUID paymentId,
+            int attemptNumber,
+            AttemptOperation operation,
+            String processorRequestId,
+            Clock clock) {
         Objects.requireNonNull(paymentId, "paymentId");
         Objects.requireNonNull(operation, "operation");
+        Objects.requireNonNull(processorRequestId, "processorRequestId");
         Objects.requireNonNull(clock, "clock");
         if (attemptNumber < 1) {
             throw new IllegalArgumentException("attemptNumber starts at 1, was " + attemptNumber);
@@ -87,14 +107,30 @@ public class PaymentAttempt implements Persistable<UUID> {
         attempt.paymentId = paymentId;
         attempt.attemptNumber = attemptNumber;
         attempt.operation = operation;
+        attempt.processorRequestId = processorRequestId;
+        attempt.callCount = 1;
         attempt.outcome = AttemptOutcome.PENDING;
         attempt.createdAt = Instant.now(clock).truncatedTo(ChronoUnit.MICROS);
         return attempt;
     }
 
     /**
-     * Records how the call ended. Once only: an attempt is one call, and a second result for it
-     * would overwrite the evidence of the first.
+     * Counts a retry: another call with this same request id, about to be made. Committed before
+     * the call, like the first, so a crash mid-retry still leaves a {@code PENDING} row. Only while
+     * the attempt is open: once it has an outcome, the authorisation is over.
+     *
+     * @throws IllegalStateException if this attempt already has an outcome.
+     */
+    public void recordAnotherCall() {
+        if (this.outcome != AttemptOutcome.PENDING) {
+            throw new IllegalStateException("Attempt " + id + " already completed as " + this.outcome);
+        }
+        this.callCount++;
+    }
+
+    /**
+     * Records how the attempt ended, from its last call. Once only: a second result would
+     * overwrite the evidence of the first.
      *
      * @throws IllegalStateException if this attempt already has an outcome.
      * @throws IllegalArgumentException if {@code outcome} is {@link AttemptOutcome#PENDING}.
@@ -155,6 +191,14 @@ public class PaymentAttempt implements Persistable<UUID> {
     /** {@code null} on success. */
     public String getErrorCode() {
         return errorCode;
+    }
+
+    public String getProcessorRequestId() {
+        return processorRequestId;
+    }
+
+    public int getCallCount() {
+        return callCount;
     }
 
     /** {@code null} while PENDING. */

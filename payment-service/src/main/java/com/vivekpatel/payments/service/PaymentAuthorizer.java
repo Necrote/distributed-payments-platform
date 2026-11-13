@@ -28,11 +28,11 @@ import org.springframework.transaction.annotation.Transactional;
  * <p><b>Only the writes are transactions.</b>
  *
  * <pre>
- *   tx     CREATED -> PROCESSING, attempt 1 PENDING        commit; connection back to the pool
+ *   tx     CREATED -> PROCESSING, attempt PENDING          commit; connection back to the pool
  *          processor call                                  no transaction, no connection held
- *   tx     attempt 1 outcome, attempt 2 PENDING (if retrying)
- *          backoff, processor call                         still no connection held
- *   tx     last attempt's outcome, PROCESSING -> final status
+ *   tx     attempt call_count + 1 (if retrying)            still PENDING
+ *          backoff, processor call, same request id        still no connection held
+ *   tx     attempt outcome, PROCESSING -> final status
  * </pre>
  *
  * Holding a transaction across the call would hold a pooled connection, and row locks, for as long
@@ -46,13 +46,15 @@ import org.springframework.transaction.annotation.Transactional;
  * ~6.6 s, and no second charge is attempted while the first may still be in flight. Connection
  * failures take milliseconds and do get retried.
  *
- * <p><b>Every attempt sends the same request id.</b> It is what lets the processor recognise a retry
- * as the same authorisation. A new id per attempt would turn a retry after a broken connection into
- * a second charge. The retry here is only as safe as the processor's deduplication on that id.
+ * <p><b>Every call sends the same request id.</b> It is what lets the processor recognise a retry as
+ * the same authorisation. A new id per call would turn a retry after a broken connection into a
+ * second charge. The retry here is only as safe as the processor's deduplication on that id. And
+ * because it is the same authorisation, it is the same attempt row: a retry counts the call, it does
+ * not add a row, so a duplicated answer can never look like a second attempt.
  *
  * <p>Resilience4j's {@link Retry.Context} is driven by hand rather than through a decorator or
- * annotation, because each attempt writes its own row between calls and the deadline has to be
- * checked between attempts.
+ * annotation, because each retry writes to the attempt row between calls and the deadline has to be
+ * checked between calls.
  *
  * <p><b>Every call also goes through the circuit breaker</b>, inside the retry, so each attempt is
  * one call the breaker sees. When it is open, a call is refused locally: nothing is sent, so the
@@ -95,10 +97,11 @@ public class PaymentAuthorizer {
      *     {@code PROCESSING} when the outcome is unknown.
      */
     public Payment authorize(UUID paymentId, String idempotencyKey) {
-        AuthorizationStarted started = payments.startAuthorization(paymentId);
+        String requestId = AuthorizeRequest.requestIdFor(paymentId);
+        AuthorizationStarted started = payments.startAuthorization(paymentId, requestId);
         Payment payment = started.payment();
         AuthorizeRequest request = new AuthorizeRequest(
-                AuthorizeRequest.requestIdFor(paymentId),
+                requestId,
                 payment.getPaymentMethodToken(),
                 payment.getAmount().minorUnits(),
                 payment.getAmount().currencyCode());
@@ -120,15 +123,15 @@ public class PaymentAuthorizer {
             }
             Duration latency = Duration.ofNanos(System.nanoTime() - attemptStartedAt);
             if (failure != null) {
-                log.info("Authorisation attempt for payment {} ended {} ({}) after {} ms",
+                // The row keeps only the last call's outcome, so each failed call is logged here.
+                log.info("Authorisation call for payment {} ended {} ({}) after {} ms",
                         paymentId, result.outcome(), result.errorCode(), latency.toMillis());
             }
 
             if (failure == null || !waitForRetry(retryContext, failure, startedAt)) {
                 return payments.completeAuthorization(attemptId, result, latency, idempotencyKey);
             }
-            payments.recordFailedAttempt(attemptId, result, latency);
-            attemptId = payments.startNextAttempt(paymentId);
+            payments.recordAnotherCall(attemptId);
         }
     }
 

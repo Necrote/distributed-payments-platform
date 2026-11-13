@@ -17,12 +17,15 @@ class PaymentAttemptTest {
     private static final Clock FIXED =
             Clock.fixed(Instant.parse("2026-10-30T09:00:00.123456789Z"), ZoneOffset.UTC);
     private static final UUID PAYMENT = UUID.randomUUID();
+    private static final String REQUEST_ID = "authorize:" + PAYMENT;
 
     @Test
     void startsPendingWithNothingRecordedYet() {
-        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, FIXED);
+        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, REQUEST_ID, FIXED);
 
         assertThat(attempt.getOutcome()).isEqualTo(AttemptOutcome.PENDING);
+        assertThat(attempt.getProcessorRequestId()).isEqualTo(REQUEST_ID);
+        assertThat(attempt.getCallCount()).isOne();
         assertThat(attempt.getPaymentId()).isEqualTo(PAYMENT);
         assertThat(attempt.getAttemptNumber()).isOne();
         assertThat(attempt.getOperation()).isEqualTo(AttemptOperation.AUTHORIZE);
@@ -37,7 +40,7 @@ class PaymentAttemptTest {
     @Test
     void notNewOnceLoadedOrPersisted() {
         // Otherwise save() on a loaded attempt would try to INSERT it again.
-        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, FIXED);
+        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, REQUEST_ID, FIXED);
 
         attempt.markNotNew();
 
@@ -47,13 +50,13 @@ class PaymentAttemptTest {
 
     @Test
     void attemptNumbersStartAtOne() {
-        assertThatThrownBy(() -> PaymentAttempt.start(PAYMENT, 0, AttemptOperation.AUTHORIZE, FIXED))
+        assertThatThrownBy(() -> PaymentAttempt.start(PAYMENT, 0, AttemptOperation.AUTHORIZE, REQUEST_ID, FIXED))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     void completeRecordsTheOutcomeReferenceAndLatency() {
-        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, FIXED);
+        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, REQUEST_ID, FIXED);
 
         attempt.complete(AttemptOutcome.SUCCESS, "auth_1", null, Duration.ofMillis(137));
 
@@ -66,7 +69,7 @@ class PaymentAttemptTest {
     @Test
     void anAttemptCompletesOnceOnly() {
         // A second result would overwrite the evidence of the first.
-        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, FIXED);
+        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, REQUEST_ID, FIXED);
         attempt.complete(AttemptOutcome.TIMEOUT, null, "READ_TIMEOUT", Duration.ofSeconds(2));
 
         assertThatThrownBy(() -> attempt.complete(AttemptOutcome.SUCCESS, "auth_1", null, Duration.ZERO))
@@ -75,8 +78,34 @@ class PaymentAttemptTest {
     }
 
     @Test
+    void aRetryWithTheSameRequestIdCountsACallOnTheSameRowAndKeepsItOpen() {
+        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, REQUEST_ID, FIXED);
+
+        attempt.recordAnotherCall();
+        attempt.recordAnotherCall();
+
+        assertThat(attempt.getCallCount()).isEqualTo(3);
+        assertThat(attempt.getOutcome()).isEqualTo(AttemptOutcome.PENDING);
+    }
+
+    @Test
+    void noMoreCallsOnceTheAttemptHasAnOutcome() {
+        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, REQUEST_ID, FIXED);
+        attempt.complete(AttemptOutcome.SUCCESS, "auth_1", null, Duration.ofMillis(10));
+
+        assertThatThrownBy(attempt::recordAnotherCall).isInstanceOf(IllegalStateException.class);
+        assertThat(attempt.getCallCount()).isOne();
+    }
+
+    @Test
+    void anAttemptNeedsTheRequestIdItWillSend() {
+        assertThatThrownBy(() -> PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, null, FIXED))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
     void pendingIsNotAnOutcome() {
-        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, FIXED);
+        PaymentAttempt attempt = PaymentAttempt.start(PAYMENT, 1, AttemptOperation.AUTHORIZE, REQUEST_ID, FIXED);
 
         assertThatThrownBy(() -> attempt.complete(AttemptOutcome.PENDING, null, null, Duration.ZERO))
                 .isInstanceOf(IllegalArgumentException.class);

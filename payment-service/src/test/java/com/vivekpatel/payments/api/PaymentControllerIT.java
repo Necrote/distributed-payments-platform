@@ -1,6 +1,7 @@
 package com.vivekpatel.payments.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -266,7 +267,7 @@ class PaymentControllerIT {
      * is what makes retrying after a broken connection safe at a processor that deduplicates.
      */
     @Test
-    void brokenConnectionsAreRetriedWithTheSameRequestIdAndARowPerCall() throws Exception {
+    void brokenConnectionsAreRetriedWithTheSameRequestIdOnOneAttemptRow() throws Exception {
         processor.breakNextConnections(2);
         int callsBefore = processor.requestBodies().size();
 
@@ -276,14 +277,54 @@ class PaymentControllerIT {
                 .andReturn().getResponse().getContentAsString();
         UUID id = UUID.fromString(JsonPath.read(body, "$.id"));
 
-        assertThat(jdbc.queryForList(
-                        "SELECT outcome FROM payment_attempts WHERE payment_id = ? ORDER BY attempt_number",
-                        String.class, id))
-                .containsExactly("UNKNOWN", "UNKNOWN", "SUCCESS");
+        // Three calls, one request id, so one attempt - with the calls counted on it.
+        assertThat(jdbc.queryForMap(
+                        "SELECT outcome, call_count, processor_request_id FROM payment_attempts WHERE payment_id = ?", id))
+                .containsEntry("outcome", "SUCCESS")
+                .containsEntry("call_count", 3)
+                .containsEntry("processor_request_id", "authorize:" + id);
         List<String> calls = processor.requestBodies();
         assertThat(calls.subList(callsBefore, calls.size()))
                 .hasSize(3)
                 .allSatisfy(call -> assertThat(call).contains("\"requestId\":\"authorize:" + id + "\""));
+    }
+
+    /**
+     * Today's "done", duplication half: the processor authorises, the answer is cut off, the retry
+     * gets the same answer again. One authorisation, one attempt row, one authorisation id.
+     */
+    @Test
+    void aDuplicatedAnswerIsOneAttemptWithOneAuthorisation() throws Exception {
+        processor.cutOffNextBodies(1);
+
+        String body = mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("AUTHORIZED"))
+                .andReturn().getResponse().getContentAsString();
+        UUID id = UUID.fromString(JsonPath.read(body, "$.id"));
+
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                "SELECT outcome, call_count, processor_reference FROM payment_attempts WHERE payment_id = ?", id);
+        assertThat(rows).singleElement().satisfies(row -> {
+            assertThat(row).containsEntry("outcome", "SUCCESS").containsEntry("call_count", 2);
+            assertThat((String) row.get("processor_reference")).startsWith("auth_");
+        });
+    }
+
+    @Test
+    void theDatabaseRefusesASecondAttemptRowForTheSameRequestId() throws Exception {
+        // Not only the code: even a bug that tried to insert one would hit the constraint.
+        UUID id = createPayment();
+
+        assertThatThrownBy(() -> jdbc.update(
+                        """
+                        INSERT INTO payment_attempts (id, payment_id, attempt_number, operation, outcome,
+                                                      processor_request_id, call_count)
+                        VALUES (?, ?, 2, 'AUTHORIZE', 'SUCCESS', ?, 1)
+                        """,
+                        UUID.randomUUID(), id, "authorize:" + id))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class)
+                .hasMessageContaining("payment_attempts_one_row_per_request");
     }
 
     @Test

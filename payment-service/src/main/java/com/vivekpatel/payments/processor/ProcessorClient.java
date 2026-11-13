@@ -1,6 +1,7 @@
 package com.vivekpatel.payments.processor;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import io.github.resilience4j.timelimiter.TimeLimiter;
 import io.github.resilience4j.timelimiter.TimeLimiterRegistry;
 import java.io.IOException;
@@ -122,6 +123,13 @@ public class ProcessorClient {
         try {
             body = response.bodyTo(AuthorizeResponse.class);
         } catch (RestClientException e) {
+            // Two different failures share this exception. A body we read but could not parse is
+            // the processor answering badly; a body cut off mid-read is the connection breaking,
+            // which is retryable with the same request id - the processor's DUPLICATE_RESPONSE
+            // case. Telling them apart is the I/O failure underneath.
+            if (hasCause(e, IOException.class) && !hasCause(e, JsonProcessingException.class)) {
+                throw new ProcessorException.ConnectionBroken(e);
+            }
             throw new ProcessorException.OutcomeUnknown("MALFORMED_RESPONSE", e);
         }
         // An answer to someone else's request is not an answer to ours.
@@ -170,6 +178,15 @@ public class ProcessorClient {
             }
         }
         return new ProcessorException.ConnectionBroken(e);
+    }
+
+    private static boolean hasCause(Throwable e, Class<? extends Throwable> type) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (type.isInstance(t)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

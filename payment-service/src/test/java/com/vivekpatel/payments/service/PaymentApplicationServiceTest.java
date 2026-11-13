@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.AdditionalAnswers.returnsFirstArg;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
@@ -52,7 +54,7 @@ class PaymentApplicationServiceTest {
         Payment payment = stored(Payment.create("m-1", Money.of(12500, "INR"), "tok", null, FIXED));
         when(attempts.save(any(PaymentAttempt.class))).then(returnsFirstArg());
 
-        AuthorizationStarted started = service.startAuthorization(payment.getId());
+        AuthorizationStarted started = service.startAuthorization(payment.getId(), "authorize:x");
 
         assertThat(started.payment().getStatus()).isEqualTo(PaymentStatus.PROCESSING);
         assertThat(started.attemptId()).isNotNull();
@@ -65,11 +67,12 @@ class PaymentApplicationServiceTest {
         PaymentAttempt[] saved = new PaymentAttempt[1];
         when(attempts.save(any(PaymentAttempt.class))).then(inv -> saved[0] = inv.getArgument(0));
 
-        service.startAuthorization(payment.getId());
+        service.startAuthorization(payment.getId(), "authorize:x");
 
         assertThat(saved[0].getAttemptNumber()).isEqualTo(3);
         assertThat(saved[0].getOutcome()).isEqualTo(AttemptOutcome.PENDING);
         assertThat(saved[0].getOperation()).isEqualTo(AttemptOperation.AUTHORIZE);
+        assertThat(saved[0].getProcessorRequestId()).isEqualTo("authorize:x");
     }
 
     @Test
@@ -132,31 +135,17 @@ class PaymentApplicationServiceTest {
     }
 
     @Test
-    void aFailedAttemptIsClosedWithoutMovingThePaymentBecauseARetryFollows() {
+    void aRetryCountsTheCallOnTheSameRowAndAddsNone() {
+        // Same request id, same authorisation, same attempt: nothing is saved, the row is updated.
         Payment payment = processing();
         PaymentAttempt attempt = pendingAttemptFor(payment);
 
-        service.recordFailedAttempt(
-                attempt.getId(), new AttemptResult(AttemptOutcome.FAILURE, null, "CONNECT_FAILED"), LATENCY);
+        service.recordAnotherCall(attempt.getId());
 
-        assertThat(attempt.getOutcome()).isEqualTo(AttemptOutcome.FAILURE);
-        assertThat(attempt.getErrorCode()).isEqualTo("CONNECT_FAILED");
+        assertThat(attempt.getCallCount()).isEqualTo(2);
+        assertThat(attempt.getOutcome()).isEqualTo(AttemptOutcome.PENDING);
         assertThat(payment.getStatus()).isEqualTo(PaymentStatus.PROCESSING);
-    }
-
-    @Test
-    void aRetryOpensTheNextNumberedAttemptWithoutMovingThePayment() {
-        Payment payment = processing();
-        when(attempts.countByPaymentIdAndOperation(payment.getId(), AttemptOperation.AUTHORIZE)).thenReturn(1L);
-        PaymentAttempt[] saved = new PaymentAttempt[1];
-        when(attempts.save(any(PaymentAttempt.class))).then(inv -> saved[0] = inv.getArgument(0));
-
-        UUID next = service.startNextAttempt(payment.getId());
-
-        assertThat(next).isEqualTo(saved[0].getId());
-        assertThat(saved[0].getAttemptNumber()).isEqualTo(2);
-        assertThat(saved[0].getOutcome()).isEqualTo(AttemptOutcome.PENDING);
-        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.PROCESSING);
+        verify(attempts, never()).save(any());
     }
 
     @Test
@@ -194,7 +183,8 @@ class PaymentApplicationServiceTest {
     }
 
     private PaymentAttempt pendingAttemptFor(Payment payment) {
-        PaymentAttempt attempt = PaymentAttempt.start(payment.getId(), 1, AttemptOperation.AUTHORIZE, FIXED);
+        PaymentAttempt attempt = PaymentAttempt.start(
+                payment.getId(), 1, AttemptOperation.AUTHORIZE, "authorize:" + payment.getId(), FIXED);
         when(attempts.findById(attempt.getId())).thenReturn(Optional.of(attempt));
         return attempt;
     }

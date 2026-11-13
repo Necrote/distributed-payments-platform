@@ -188,31 +188,24 @@ public class PaymentApplicationService {
      *     {@code CREATED}.
      */
     @Transactional
-    public AuthorizationStarted startAuthorization(UUID paymentId) {
+    public AuthorizationStarted startAuthorization(UUID paymentId, String processorRequestId) {
         Payment payment = load(paymentId);
         payment.transitionTo(PaymentStatus.PROCESSING, clock);
-        return new AuthorizationStarted(payment, openAuthorizeAttempt(paymentId));
+        int attemptNumber =
+                Math.toIntExact(attempts.countByPaymentIdAndOperation(paymentId, AttemptOperation.AUTHORIZE)) + 1;
+        PaymentAttempt attempt = attempts.save(PaymentAttempt.start(
+                paymentId, attemptNumber, AttemptOperation.AUTHORIZE, processorRequestId, clock));
+        return new AuthorizationStarted(payment, attempt.getId());
     }
 
     /**
-     * A retry's bookkeeping: closes an attempt that is not the last. The payment does not move,
-     * because the authorisation is still going on.
+     * A retry's bookkeeping: the same request id is about to be sent again, so it is the same
+     * attempt, and this counts the call on its row instead of adding one. Committed before the call
+     * so a crash mid-retry still leaves the row {@code PENDING}. The payment does not move.
      */
     @Transactional
-    public void recordFailedAttempt(UUID attemptId, AttemptResult result, Duration latency) {
-        loadAttempt(attemptId).complete(
-                result.outcome(), result.processorReference(), result.errorCode(), latency);
-    }
-
-    /**
-     * Opens the {@code PENDING} row for a retry, committed before the call for the same reason as
-     * the first attempt's. One row per call, numbered in order, because each call could be a charge.
-     *
-     * @return the new attempt's id.
-     */
-    @Transactional
-    public UUID startNextAttempt(UUID paymentId) {
-        return openAuthorizeAttempt(paymentId);
+    public void recordAnotherCall(UUID attemptId) {
+        loadAttempt(attemptId).recordAnotherCall();
     }
 
     /**
@@ -249,13 +242,6 @@ public class PaymentApplicationService {
                             payment.getId(), responseStatus.value(), responseBody(payment)));
         }
         return payment;
-    }
-
-    private UUID openAuthorizeAttempt(UUID paymentId) {
-        int attemptNumber =
-                Math.toIntExact(attempts.countByPaymentIdAndOperation(paymentId, AttemptOperation.AUTHORIZE)) + 1;
-        return attempts.save(PaymentAttempt.start(paymentId, attemptNumber, AttemptOperation.AUTHORIZE, clock))
-                .getId();
     }
 
     private PaymentAttempt loadAttempt(UUID attemptId) {

@@ -44,8 +44,6 @@ class PaymentAuthorizerTest {
             Clock.fixed(Instant.parse("2026-11-02T09:00:00Z"), ZoneOffset.UTC);
     private static final Duration LONGEST_CALL = Duration.ofSeconds(1);
     private static final UUID FIRST_ATTEMPT = UUID.randomUUID();
-    private static final UUID SECOND_ATTEMPT = UUID.randomUUID();
-    private static final UUID THIRD_ATTEMPT = UUID.randomUUID();
 
     // Ignores NotProcessed like production, so CIRCUIT_OPEN and 4xx never count; a fresh registry
     // per test, so one test's failures never open another's breaker.
@@ -62,9 +60,8 @@ class PaymentAuthorizerTest {
 
     @BeforeEach
     void stubTheWrites() {
-        when(payments.startAuthorization(payment.getId()))
+        when(payments.startAuthorization(payment.getId(), request.requestId()))
                 .thenReturn(new AuthorizationStarted(payment, FIRST_ATTEMPT));
-        when(payments.startNextAttempt(payment.getId())).thenReturn(SECOND_ATTEMPT, THIRD_ATTEMPT);
         when(payments.completeAuthorization(any(), any(), any(), any())).thenReturn(payment);
     }
 
@@ -80,7 +77,7 @@ class PaymentAuthorizerTest {
                 latency.capture(), eq("key-1"));
         // Measured around the call: a mocked processor answers in well under a second.
         assertThat(latency.getValue()).isBetween(Duration.ZERO, Duration.ofSeconds(5));
-        verify(payments, never()).startNextAttempt(any());
+        verify(payments, never()).recordAnotherCall(any());
     }
 
     @Test
@@ -115,7 +112,7 @@ class PaymentAuthorizerTest {
     }
 
     @Test
-    void connectionFailuresAreRetriedAndEachCallGetsItsOwnAttempt() {
+    void connectionFailuresAreRetriedOnOneAttemptThatCountsEachCall() {
         when(processor.authorize(request))
                 .thenThrow(new ProcessorException.ConnectFailed(null))
                 .thenThrow(new ProcessorException.ConnectFailed(null))
@@ -124,11 +121,10 @@ class PaymentAuthorizerTest {
         authorizer.authorize(payment.getId(), "key-1");
 
         verify(processor, times(3)).authorize(request);
-        AttemptResult failed = new AttemptResult(AttemptOutcome.FAILURE, null, "CONNECT_FAILED");
-        verify(payments).recordFailedAttempt(eq(FIRST_ATTEMPT), eq(failed), any());
-        verify(payments).recordFailedAttempt(eq(SECOND_ATTEMPT), eq(failed), any());
+        // One authorisation, one attempt: the two retries are counted on it, never a new row.
+        verify(payments, times(2)).recordAnotherCall(FIRST_ATTEMPT);
         verify(payments).completeAuthorization(
-                eq(THIRD_ATTEMPT), eq(new AttemptResult(AttemptOutcome.SUCCESS, "auth_9", null)), any(), eq("key-1"));
+                eq(FIRST_ATTEMPT), eq(new AttemptResult(AttemptOutcome.SUCCESS, "auth_9", null)), any(), eq("key-1"));
     }
 
     @Test
@@ -138,9 +134,9 @@ class PaymentAuthorizerTest {
         authorizer.authorize(payment.getId(), null);
 
         verify(processor, times(3)).authorize(any());
-        verify(payments, times(2)).recordFailedAttempt(any(), any(), any());
+        verify(payments, times(2)).recordAnotherCall(FIRST_ATTEMPT);
         verify(payments).completeAuthorization(
-                eq(THIRD_ATTEMPT), eq(new AttemptResult(AttemptOutcome.FAILURE, null, "CONNECT_FAILED")),
+                eq(FIRST_ATTEMPT), eq(new AttemptResult(AttemptOutcome.FAILURE, null, "CONNECT_FAILED")),
                 any(), isNull());
     }
 
@@ -156,7 +152,7 @@ class PaymentAuthorizerTest {
         verify(processor, times(3)).authorize(sent.capture());
         assertThat(sent.getAllValues()).extracting(AuthorizeRequest::requestId).containsOnly(request.requestId());
         verify(payments).completeAuthorization(
-                eq(THIRD_ATTEMPT), eq(new AttemptResult(AttemptOutcome.UNKNOWN, null, "IO_ERROR")),
+                eq(FIRST_ATTEMPT), eq(new AttemptResult(AttemptOutcome.UNKNOWN, null, "IO_ERROR")),
                 any(), isNull());
     }
 
@@ -180,7 +176,7 @@ class PaymentAuthorizerTest {
         authorizerWithDeadline(LONGEST_CALL.minusMillis(1)).authorize(payment.getId(), null);
 
         verify(processor, times(1)).authorize(any());
-        verify(payments, never()).startNextAttempt(any());
+        verify(payments, never()).recordAnotherCall(any());
         verifyCompletedOnFirstAttempt(new AttemptResult(AttemptOutcome.TIMEOUT, null, "READ_TIMEOUT"));
     }
 
@@ -205,7 +201,7 @@ class PaymentAuthorizerTest {
         tight.authorize(payment.getId(), null);
 
         verify(processor, times(1)).authorize(any());
-        verify(payments, never()).startNextAttempt(any());
+        verify(payments, never()).recordAnotherCall(any());
     }
 
     @Test
@@ -254,7 +250,7 @@ class PaymentAuthorizerTest {
 
     private void verifyCompletedOnFirstAttempt(AttemptResult expected) {
         verify(payments).completeAuthorization(eq(FIRST_ATTEMPT), eq(expected), any(), isNull());
-        verify(payments, never()).recordFailedAttempt(any(), any(), any());
+        verify(payments, never()).recordAnotherCall(any());
     }
 
     private PaymentAuthorizer authorizerWithDeadline(Duration totalDeadline) {

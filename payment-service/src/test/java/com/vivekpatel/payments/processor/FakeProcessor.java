@@ -35,7 +35,11 @@ public final class FakeProcessor implements AutoCloseable {
     private final HttpServer server;
     private final List<String> requestBodies = new CopyOnWriteArrayList<>();
     private final AtomicInteger connectionsToBreak = new AtomicInteger();
-    private volatile Function<String, Reply> replies = FakeProcessor::approve;
+    private final AtomicInteger bodiesToCutOff = new AtomicInteger();
+    private final AtomicInteger inFlight = new AtomicInteger();
+    private final AtomicInteger mostInFlight = new AtomicInteger();
+    private final java.util.Map<String, String> approvalsByRequestId = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile Function<String, Reply> replies = this::approve;
     private volatile Duration bodyStall = Duration.ZERO;
 
     private FakeProcessor(HttpServer server) {
@@ -62,9 +66,26 @@ public final class FakeProcessor implements AutoCloseable {
     }
 
     public void approveAll() {
-        replies = FakeProcessor::approve;
+        replies = this::approve;
         connectionsToBreak.set(0);
+        bodiesToCutOff.set(0);
         bodyStall = Duration.ZERO;
+        approvalsByRequestId.clear();
+        mostInFlight.set(0);
+    }
+
+    /**
+     * The next {@code count} responses are cut off halfway through the body. Approvals are kept
+     * per request id, so a retry of a cut-off request gets the same authorisation id again - the
+     * simulator's DUPLICATE_RESPONSE.
+     */
+    public void cutOffNextBodies(int count) {
+        bodiesToCutOff.set(count);
+    }
+
+    /** The most requests this fake has been handling at the same moment since the last reset. */
+    public int mostInFlight() {
+        return mostInFlight.get();
     }
 
     /** The next {@code count} requests are received, then the connection closes with no response. */
@@ -96,13 +117,24 @@ public final class FakeProcessor implements AutoCloseable {
         return List.copyOf(requestBodies);
     }
 
-    private static Reply approve(String requestId) {
+    private Reply approve(String requestId) {
+        String authorizationId = approvalsByRequestId.computeIfAbsent(requestId, id -> "auth_" + UUID.randomUUID());
         return new Reply(200, """
-                {"requestId":"%s","authorizationId":"auth_%s","status":"APPROVED","amount":12500,"currency":"INR"}"""
-                .formatted(requestId, UUID.randomUUID()), Duration.ZERO);
+                {"requestId":"%s","authorizationId":"%s","status":"APPROVED","amount":12500,"currency":"INR"}"""
+                .formatted(requestId, authorizationId), Duration.ZERO);
     }
 
     private void handle(HttpExchange exchange) throws IOException {
+        int now = inFlight.incrementAndGet();
+        mostInFlight.accumulateAndGet(now, Math::max);
+        try {
+            respond(exchange);
+        } finally {
+            inFlight.decrementAndGet();
+        }
+    }
+
+    private void respond(HttpExchange exchange) throws IOException {
         try (exchange) {
             String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
             requestBodies.add(body);
@@ -120,6 +152,12 @@ public final class FakeProcessor implements AutoCloseable {
             if (!bodyStall.isZero()) {
                 exchange.getResponseBody().flush();
                 Thread.sleep(bodyStall);
+            }
+            if (bodiesToCutOff.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                // Half the declared length, then close: the client reads a truncated body.
+                exchange.getResponseBody().write(bytes, 0, bytes.length / 2);
+                exchange.getResponseBody().flush();
+                return;
             }
             exchange.getResponseBody().write(bytes);
         } catch (InterruptedException e) {
