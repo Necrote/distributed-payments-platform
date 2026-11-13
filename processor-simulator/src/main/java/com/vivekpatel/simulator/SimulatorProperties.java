@@ -25,8 +25,12 @@ public class SimulatorProperties {
     /** Latency applied in {@link FailureMode#NORMAL}. */
     private Duration baseLatency = Duration.ofMillis(120);
 
-    /** Latency applied in {@link FailureMode#SLOW}. Tune it around the caller's read timeout. */
-    private Duration slowLatency = Duration.ofSeconds(10);
+    /**
+     * Latency applied in {@link FailureMode#SLOW}. Tune it around the caller's read timeout: above
+     * it gives timeouts, below it gives the slow-but-successful case nothing alerts on. Settable at
+     * runtime ({@code ?mode=SLOW&latency=1500ms}), hence volatile.
+     */
+    private volatile Duration slowLatency = Duration.ofSeconds(10);
 
     /** How long {@link FailureMode#TIMEOUT} sleeps before giving up on responding at all. */
     private Duration timeoutLatency = Duration.ofSeconds(60);

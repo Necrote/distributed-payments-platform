@@ -7,6 +7,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.time.Duration;
+import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -14,6 +16,7 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.ResultActions;
 
 /**
@@ -24,6 +27,7 @@ import org.springframework.test.web.servlet.ResultActions;
         "simulator.base-latency=0ms",
         "simulator.slow-latency=300ms",
         "simulator.timeout-latency=600ms",
+        "simulator.outage-duration=300ms",
         "simulator.decline-rate=0"
 })
 @AutoConfigureMockMvc
@@ -42,6 +46,58 @@ class SimulatorControllerTest {
     @AfterEach
     void backToNormal() {
         properties.setMode(FailureMode.NORMAL);
+        properties.setSlowLatency(Duration.ofMillis(300));
+    }
+
+    @Test
+    void duplicateResponseCutsTheFirstDeliveryOffAndRepeatsTheAnswerWhole() throws Exception {
+        String body = BODY.replace("req-1", "req-dup-" + UUID.randomUUID());
+        setMode("DUPLICATE_RESPONSE");
+
+        // First delivery: authorised, then cut off - half the declared length, and the connection
+        // closes. MockMvc has no connection; what it can check is the half body and the close.
+        MvcResult first = mockMvc.perform(post("/authorize").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(header().string("Connection", "close"))
+                .andReturn();
+        assertThat(first.getResponse().getContentAsByteArray().length)
+                .isEqualTo(first.getResponse().getContentLength() / 2);
+
+        String second = mockMvc.perform(post("/authorize").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("APPROVED"))
+                .andReturn().getResponse().getContentAsString();
+        String third = mockMvc.perform(post("/authorize").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andReturn().getResponse().getContentAsString();
+        // The same authorisation every time after: the first delivery's, not a new one.
+        assertThat(third).isEqualTo(second);
+    }
+
+    @Test
+    void outageAnswers503ForItsWindowThenRecoversByItself() throws Exception {
+        setMode("OUTAGE");
+        authorize().andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.error").value("OUTAGE"));
+
+        Thread.sleep(400);
+
+        authorize().andExpect(status().isOk()).andExpect(jsonPath("$.status").value("APPROVED"));
+        assertThat(properties.getMode()).isEqualTo(FailureMode.NORMAL);
+    }
+
+    @Test
+    void slowLatencyCanBeSetWithTheMode() throws Exception {
+        mockMvc.perform(put("/control/mode").param("mode", "SLOW").param("latency", "50ms"))
+                .andExpect(status().isOk());
+        assertThat(properties.getSlowLatency()).isEqualTo(Duration.ofMillis(50));
+
+        mockMvc.perform(put("/control/mode").param("mode", "SLOW").param("latency", "PT0.2S"))
+                .andExpect(status().isOk());
+        assertThat(properties.getSlowLatency()).isEqualTo(Duration.ofMillis(200));
+
+        mockMvc.perform(put("/control/mode").param("mode", "SLOW").param("latency", "-1s"))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(put("/control/mode").param("mode", "SLOW").param("latency", "soon"))
+                .andExpect(status().isBadRequest());
     }
 
     @Test
@@ -113,12 +169,6 @@ class SimulatorControllerTest {
         authorize()
                 .andExpect(status().isTooManyRequests())
                 .andExpect(header().string("Retry-After", "1"));
-    }
-
-    @Test
-    void modesNotBuiltYetSay501InsteadOfPretending() throws Exception {
-        setMode("OUTAGE");
-        authorize().andExpect(status().isNotImplemented());
     }
 
     @Test

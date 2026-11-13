@@ -10,6 +10,13 @@ server:
 spring:
   application:
     name: processor-simulator
+  threads:
+    virtual:
+      # On here, unlike payment-service. SLOW mode sleeps on the request thread, and a bulkhead or
+      # thread-exhaustion experiment needs the simulator to hold hundreds of slow calls at once
+      # without running out of threads itself. The simulator must never be the bottleneck being
+      # measured.
+      enabled: true
 
 simulator:
   # NORMAL | SLOW | TIMEOUT | HTTP_500 | HTTP_429 | INTERMITTENT | DUPLICATE_RESPONSE | OUTAGE
