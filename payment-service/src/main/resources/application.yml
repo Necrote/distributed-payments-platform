@@ -55,7 +55,7 @@ management:
       exposure:
         # circuitbreakers: current state of each breaker; circuitbreakerevents: its recent
         # transitions and recorded calls, which is how the breaker's lifecycle can be narrated.
-        include: health,info,metrics,prometheus,flyway,circuitbreakers,circuitbreakerevents
+        include: health,info,metrics,prometheus,flyway,circuitbreakers,circuitbreakerevents,bulkheads
   endpoint:
     health:
       show-details: when-authorized
@@ -150,14 +150,19 @@ resilience4j:
         # Off, deliberately. With it on, an open breaker makes /actuator/health DOWN, and an
         # orchestrator restarts or unrolls every instance because one dependency is down.
         registerHealthIndicator: false
-
-# Phase 3 (Day 17). Left commented so this file does not claim resilience it has not
-# demonstrated; the guide switches it on with its own failure scenario.
-# resilience4j:
-#   bulkhead:
-#     instances:
-#       processor:
-#         maxConcurrentCalls: 20          # one slow dependency must not eat every request thread
+  # How many payments may be creating and authorising at once. Each holds a request thread for as
+  # long as the processor takes, and Tomcat has 200. Without a cap a slow processor takes all 200,
+  # and every other request - reads included - queues behind it. At 20 the processor path can never
+  # hold more than a tenth of the threads. Capacity at 20: ~160 payments/s at the normal 120ms,
+  # ~13/s if the processor slows to 1.5s, which is the point: slow it down and the payment path
+  # sheds load instead of taking the service down with it.
+  bulkhead:
+    instances:
+      processor:
+        maxConcurrentCalls: 20
+        # Refuse at once rather than wait. A request waiting for a permit still holds its thread,
+        # which is the exhaustion this exists to prevent.
+        maxWaitDuration: 0
 
 logging:
   level:

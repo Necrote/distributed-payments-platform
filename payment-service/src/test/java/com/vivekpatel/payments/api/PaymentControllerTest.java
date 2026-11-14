@@ -29,6 +29,7 @@ import com.vivekpatel.payments.service.PaymentApplicationService;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import com.vivekpatel.payments.service.PaymentOutcomeUnknownException;
 import com.vivekpatel.payments.service.ProcessorUnavailableException;
+import com.vivekpatel.payments.service.TooManyPaymentsInFlightException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -323,6 +324,19 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.detail").value(containsString("Do not create a new payment")))
                 .andExpect(header().string("Location", "/payments/" + id))
                 .andExpect(header().doesNotExist(PaymentController.REPLAYED_HEADER));
+    }
+
+    @Test
+    void aFullBulkheadIs503WithRetryAfterAndSaysNothingWasCharged() throws Exception {
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new TooManyPaymentsInFlightException(java.time.Duration.ofSeconds(1)));
+
+        mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(header().string("Retry-After", "1"))
+                .andExpect(jsonPath("$.title").value("Too many payments in progress"))
+                .andExpect(jsonPath("$.detail").value(containsString("nothing was charged")))
+                .andExpect(jsonPath("$.detail").value(containsString("same Idempotency-Key")));
     }
 
     @Test

@@ -95,8 +95,9 @@ public class PaymentController {
                     schema = @Schema(implementation = ProblemDetail.class)))
     @ApiResponse(
             responseCode = "503",
-            description = "The processor's circuit breaker is open. Nothing was created or charged; "
-                    + "retry after `Retry-After` seconds with the same Idempotency-Key",
+            description = "The processor's circuit breaker is open, or too many payments are already "
+                    + "waiting on it (the bulkhead). Nothing was created or charged; retry after "
+                    + "`Retry-After` seconds with the same Idempotency-Key",
             content = @Content(
                     mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
                     schema = @Schema(implementation = ProblemDetail.class)))

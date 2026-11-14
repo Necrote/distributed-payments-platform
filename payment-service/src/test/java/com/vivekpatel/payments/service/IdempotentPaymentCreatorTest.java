@@ -15,6 +15,9 @@ import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
 import com.vivekpatel.payments.domain.PaymentStatus;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Duration;
@@ -39,7 +42,70 @@ class IdempotentPaymentCreatorTest {
     private final PaymentApplicationService service = mock(PaymentApplicationService.class);
     private final PaymentAuthorizer authorizer = mock(PaymentAuthorizer.class);
     private final ObjectMapper mapper = JsonMapper.builder().findAndAddModules().build();
-    private final IdempotentPaymentCreator creator = new IdempotentPaymentCreator(service, authorizer, mapper);
+    // A bulkhead of one, so a test can fill it by holding the single permit.
+    private final Bulkhead bulkhead = Bulkhead.of("processor",
+            BulkheadConfig.custom().maxConcurrentCalls(1).maxWaitDuration(Duration.ZERO).build());
+    private final BulkheadRegistry bulkheads = BulkheadRegistry.ofDefaults();
+    private final IdempotentPaymentCreator creator;
+
+    IdempotentPaymentCreatorTest() {
+        bulkheads.addConfiguration("one", bulkhead.getBulkheadConfig());
+        bulkheads.bulkhead("processor", "one");
+        creator = new IdempotentPaymentCreator(service, authorizer, bulkheads, mapper);
+    }
+
+    private Bulkhead bulkhead() {
+        return bulkheads.bulkhead("processor");
+    }
+
+    @Test
+    void aFullBulkheadRefusesANewPaymentAndCreatesNothing() {
+        assertThat(bulkhead().tryAcquirePermission()).isTrue();
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(TooManyPaymentsInFlightException.class,
+                        e -> assertThat(e.getRetryAfter()).isEqualTo(Duration.ofSeconds(1)));
+        verify(service, never()).create(any(), any(), any(), any(), any());
+        verify(authorizer, never()).authorize(any(), any());
+    }
+
+    @Test
+    void aFullBulkheadStillReplaysAKeyThatWasAlreadyUsed() throws Exception {
+        assertThat(bulkhead().tryAcquirePermission()).isTrue();
+        Payment original = payment();
+        IdempotencyKey stored = storedKey(
+                PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", "ref"), original);
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
+
+        assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isEqualTo(new CreatePaymentResult.Replayed(PaymentResponse.from(original)));
+        // It never took a permit, so it must not give one back either.
+        assertThat(bulkhead().getMetrics().getAvailableConcurrentCalls()).isZero();
+    }
+
+    @Test
+    void thePermitIsReturnedWhenTheRequestFinishes() {
+        Payment created = payment();
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenReturn(created);
+        when(authorizer.authorize(created.getId(), KEY)).thenReturn(created);
+
+        creator.create("m-1", AMOUNT, "tok", "ref", KEY);
+
+        assertThat(bulkhead().getMetrics().getAvailableConcurrentCalls()).isOne();
+    }
+
+    @Test
+    void thePermitIsReturnedEvenWhenTheRequestFails() {
+        // Otherwise every failure would leak a permit, and the bulkhead would close for good.
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(new IllegalStateException("db down"));
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(bulkhead().getMetrics().getAvailableConcurrentCalls()).isOne();
+    }
 
     @Test
     void firstCallCreatesThenAuthorizesAndReturnsTheAuthorizedPayment() {

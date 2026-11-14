@@ -6,6 +6,8 @@ import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
 import com.vivekpatel.payments.service.PaymentOutcomeUnknownException;
 import com.vivekpatel.payments.service.ProcessorUnavailableException;
+import com.vivekpatel.payments.service.TooManyPaymentsInFlightException;
+import java.time.Duration;
 import jakarta.servlet.http.HttpServletRequest;
 import java.net.URI;
 import java.util.Comparator;
@@ -196,12 +198,30 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
      */
     @ExceptionHandler(ProcessorUnavailableException.class)
     public ResponseEntity<ProblemDetail> handleProcessorUnavailable(ProcessorUnavailableException ex) {
-        long seconds = Math.max(1, (ex.getRetryAfter().toMillis() + 999) / 1000);
+        return refusedBeforeCreating(
+                "Payment processor unavailable",
+                "The payment processor is unavailable, so no payment was created and nothing was charged.",
+                ex.getRetryAfter());
+    }
+
+    /** The bulkhead is full. Same shape as the open breaker: nothing created, same key is safe. */
+    @ExceptionHandler(TooManyPaymentsInFlightException.class)
+    public ResponseEntity<ProblemDetail> handleTooManyInFlight(TooManyPaymentsInFlightException ex) {
+        return refusedBeforeCreating(
+                "Too many payments in progress",
+                "Too many payments are waiting on the payment processor right now, so this one was "
+                        + "not created and nothing was charged.",
+                ex.getRetryAfter());
+    }
+
+    private static ResponseEntity<ProblemDetail> refusedBeforeCreating(
+            String title, String whatHappened, Duration retryAfter) {
+        // Rounded up: telling a client to come back early only earns it another 503.
+        long seconds = Math.max(1, (retryAfter.toMillis() + 999) / 1000);
         ProblemDetail body = ProblemDetail.forStatusAndDetail(
                 HttpStatus.SERVICE_UNAVAILABLE,
-                "The payment processor is unavailable, so no payment was created and nothing was "
-                        + "charged. Retry after " + seconds + " seconds with the same Idempotency-Key.");
-        body.setTitle("Payment processor unavailable");
+                whatHappened + " Retry after " + seconds + " seconds with the same Idempotency-Key.");
+        body.setTitle(title);
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
                 .header(HttpHeaders.RETRY_AFTER, String.valueOf(seconds))
                 .body(body);
