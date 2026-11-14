@@ -10,8 +10,8 @@ Java 21 · Spring Boot 3 · PostgreSQL · Kafka · Redis · Kubernetes · Resili
 > **Status: Phase 3 in progress.** `payment-service` runs end to end in Docker: create, fetch,
 > capture and refund through an enforced state machine, on PostgreSQL, tested in CI against a real
 > PostgreSQL. `POST /payments` is idempotent, and it authorises each new payment with the
-> processor simulator, with bounded latency, bounded retries and a circuit breaker, recording every
-> attempt. **The bulkhead, reconciliation, Kafka and the ledger are not built yet.**
+> processor simulator, with bounded latency, bounded retries, a circuit breaker and a bulkhead,
+> recording every attempt. **Reconciliation, Kafka and the ledger are not built yet.**
 > The rest of this README describes the target design; [the roadmap](#roadmap-and-honest-status)
 > says exactly which parts are real today.
 
@@ -109,11 +109,14 @@ curl -X PUT 'http://localhost:8081/control/mode?mode=SLOW'
 | `HTTP_500` | `504` | `PROCESSING` | `UNKNOWN`, `HTTP_500` | It may have failed before the charge or after it |
 | `SLOW`, `TIMEOUT` | `504` in ~2s | `PROCESSING` | `TIMEOUT`, `READ_TIMEOUT` | We stop waiting at 2s, and the charge may still happen |
 | `INTERMITTENT` (`&failureRate=0.05`) | mostly `201`, about 1 in 20 `504` | as above | as above | Background noise. The circuit breaker must ignore it, and does |
-| simulator stopped | `201` in ~2s, then `503` | `FAILED`, then none | Three rows each, `CONNECT_FAILED` | Retried, then after 10 failed calls the circuit breaker opens |
+| `DUPLICATE_RESPONSE` | `201` | `AUTHORIZED` | One row, `call_count` 2 | The answer is cut off, the retry gets it again: one authorisation, one attempt |
+| `OUTAGE` | `504`, then `503`, then `201` | as above | as above | `503` for 30s, then recovers by itself. The breaker opens, probes and closes with no second curl |
+| `SLOW&latency=1500ms`, flooded | `201` for 20 at a time, the rest `503` at once | `AUTHORIZED` | `SUCCESS` | The bulkhead: reads stay fast because payments can't take every thread |
+| simulator stopped | `201` in ~2s, then `503` | `FAILED`, then none | One row each, `call_count` 3, `CONNECT_FAILED` | Retried, then after 10 failed calls the circuit breaker opens |
 
 The `504` names the payment and says not to create a new one: fetch it instead. The `503` means the
-circuit breaker is open: nothing was created or charged, so retry after `Retry-After` with the same
-key.
+circuit breaker is open or too many payments are already waiting on the processor: nothing was
+created or charged, so retry after `Retry-After` with the same key.
 
 Watch the breaker while you do this:
 
@@ -295,10 +298,11 @@ sequenceDiagram
 | Same key, different payload | `422`, never a silent replay of a different amount                               | `PaymentControllerIT.sameIdempotencyKeyWithDifferentPayloadIsRejected` |
 | Two concurrent captures | One wins on the optimistic-lock version, the other gets `409`, never retried     | `PaymentControllerIT`, `PaymentApplicationServiceIT` (20 runs each) |
 | Processor declines | `FAILED`, decline code recorded, a `201`. A return value, not an exception, so a breaker can't count it | `PaymentControllerIT`, `ProcessorClientTest` |
-| Processor slow | Client-side timeout bounds the wait (built); bulkhead stops it consuming every thread (*Phase 3*) | `ProcessorClientTest`, `PaymentControllerIT` |
+| Processor slow | A timeout bounds each wait; the bulkhead caps payments in flight at 20, so reads keep their threads (p95 61 ms under a flood, vs 1,119 ms without it) | `ProcessorClientTest`, `BulkheadIT`, [ADR-008](docs/adr/0008-circuit-breaker-thresholds.md) |
+| Processor answers twice | One authorisation, one attempt row: a retry with the same request id counts the call, and the database refuses a second row | `PaymentControllerIT.aDuplicatedAnswerIsOneAttemptWithOneAuthorisation` |
 | Processor returning 500 | `504`, attempt `UNKNOWN`, payment stays `PROCESSING`, not retried; counted by the circuit breaker | `ProcessorClientTest`, `PaymentAuthorizerTest` |
 | Processor times out | `504` in ~2s, attempt `TIMEOUT`, payment stays `PROCESSING`, never `FAILED` (built); reconciliation (*Phase 3*) | `PaymentControllerIT.processorTimeoutIsABounded504AndTheAttemptIsTimeoutNotFailure` |
-| Connection refused or broken | Up to 3 attempts inside a total deadline, backoff with jitter, same request id every time, one row per call | `PaymentAuthorizerTest`, `PaymentControllerIT` |
+| Connection refused or broken | Up to 3 attempts inside a total deadline, backoff with jitter, same request id every time, one attempt row with the calls counted | `PaymentAuthorizerTest`, `PaymentControllerIT` |
 | Processor down, or mostly failing | After 10 failed calls (50% of a 20-call window) the breaker opens: `503` in milliseconds, nothing created. It probes itself after 10s | `CircuitBreakerIT.theFullLifecycle`, [ADR-008](docs/adr/0008-circuit-breaker-thresholds.md) |
 | A realistic 5% error rate | The breaker stays closed: zero trips in 100,000 simulated calls, and none in 200 real payments | `CircuitBreakerIT.productionThresholdsIgnore5PercentNoiseButOpenOnARealOutage` |
 | Kafka down | Payments still succeed; the outbox drains when the broker returns                | *Phase 4* |
@@ -339,7 +343,8 @@ plus a deterministic twin that forces the stale read.
 | 2026-10-19, after killing the weakest survivors | 91 / 121 | 75% | 99% | 76% |
 | 2026-10-30, processor integration | 130 / 156 | 83% | 98% | 87% |
 | 2026-11-02, bounded retries | 158 / 187 | 84% | 96% | 89% |
-| 2026-11-05, circuit breaker | 172 / 202 | **85%** | 96% | 90% |
+| 2026-11-05, circuit breaker | 172 / 202 | 85% | 96% | 90% |
+| 2026-11-13, bulkhead, one attempt per request id | 187 / 217 | **86%** | 96% | 90% |
 
 - **Line coverage moved one point, and mutation score moved eleven.** The `Payment` entity's lines
   were already *executed* by other tests, but nothing asserted on them. Deleting the state-machine
@@ -348,7 +353,7 @@ plus a deterministic twin that forces the stale read.
 - **The gate caught new code.** The processor integration first measured 72%, which failed the build.
   The new authorisation logic only had integration tests, so it got unit tests rather than a lower
   gate.
-- **The CI gate is 85**, the measured whole percentage. PIT rounds before comparing, so a lost kill
+- **The CI gate is 86**, the measured whole percentage. PIT rounds before comparing, so a lost kill
   can pass if the score still rounds to the gate. Disabling `PaymentAuthorizerTest` fails the build.
   That was checked before trusting the gate. The gate goes up as the score does.
 - **What's left:** seven survivors that change no behaviour: `target == null` in
@@ -376,7 +381,8 @@ plus a deterministic twin that forces the stale read.
   the loser gets a `409` that tells it to fetch the payment before retrying.
 - Real authorisation over HTTP: `POST /payments` moves `CREATED → PROCESSING → AUTHORIZED | FAILED`,
   with explicit connect and read timeouts and no transaction held during the call. A `payment_attempts`
-  row is written before each call and completed after it.
+  row is written before the call and completed after it: one row per processor request id, so retries
+  and a duplicated answer count calls on it rather than adding rows.
 - Bounded retries: up to 3 attempts for connection failures, with exponential backoff and jitter, the
   same request id on every call, and a total deadline. A read timeout uses up that deadline, so the
   client gets a `504` in ~2s rather than ~6.6s. Declines, `4xx` and `5xx` are never retried.
@@ -384,9 +390,14 @@ plus a deterministic twin that forces the stale read.
   rate ([ADR-008](docs/adr/0008-circuit-breaker-thresholds.md)). An open breaker answers `503` with
   `Retry-After` before anything is written, and probes the processor on its own. Its state is at
   `/actuator/circuitbreakers`.
-- `processor-simulator`, switchable at runtime with one curl: `/authorize` handles `NORMAL`, `SLOW`,
-  `TIMEOUT`, `HTTP_500`, `HTTP_429` and `INTERMITTENT` (with a settable failure rate), and answers a
-  repeated request id with its original answer.
+- A bulkhead: at most 20 payments creating and authorising at once. The rest get `503` immediately,
+  before anything is written, so a slow processor can't take every request thread. Measured: reads
+  under a 300-client flood stay as fast as with no flood. Why a bulkhead still matters with virtual
+  threads is in [ADR-008](docs/adr/0008-circuit-breaker-thresholds.md).
+- `processor-simulator`, switchable at runtime with one curl: `/authorize` handles all eight modes,
+  `NORMAL`, `SLOW` (with a settable latency), `TIMEOUT`, `HTTP_500`, `HTTP_429`, `INTERMITTENT` (with a
+  settable failure rate), `DUPLICATE_RESPONSE` and `OUTAGE`, and answers a repeated request id with its
+  original answer.
 - Uniform RFC 7807 errors; OpenAPI/Swagger UI generated from the controllers.
 - CI on every push: unit tests and Testcontainers integration tests against a real PostgreSQL,
   plus a PIT mutation-score gate set from a measured score. See [Testing](#testing).
@@ -397,9 +408,7 @@ plus a deterministic twin that forces the stale read.
 - **The `Idempotency-Key` is still optional.** A `POST` without one creates a payment with no
   replay protection, so a client that retries it gets a second payment. Making the header required
   is next. Expired keys are not swept yet either, so they keep replaying past 24h.
-- **No bulkhead.** The circuit breaker stops calls to a processor that's failing, but nothing caps how
-  many calls can wait on a *slow* one at once. A brief `429` isn't retried either, so it fails the
-  payment outright.
+- **A brief `429` isn't retried**, so it fails the payment outright.
 - **No reconciliation.** A payment left in `PROCESSING` by a timeout or a `5xx` stays there, and so
   does one whose process died mid-call. A payment can also stay `CREATED` if the process dies right
   after creating it. Nothing finds these yet, and a retry with the same key only replays.
@@ -408,8 +417,9 @@ plus a deterministic twin that forces the stale read.
   that is it a clean `503`. The same happens to a request that slips past the breaker check just as it
   opens.
 - **Capture and refund don't call the processor.** They only change state here. `processor-simulator`
-  still returns `501` for `/capture`, `/refund`, `/control/reset` and the `DUPLICATE_RESPONSE` and
-  `OUTAGE` modes.
+  still returns `501` for `/capture`, `/refund` and `/control/reset`.
+- **An attempt row keeps only its last call's outcome.** Since retries share a row, the outcomes of
+  earlier failed calls are in the logs, not the table.
 - **No Kafka, outbox or ledger.** `GET /payments/{id}/ledger` returns `501`. `ledger-service` is a
   placeholder with no runnable logic.
 - **Concurrency is proven for capture only.** Two simultaneous captures give exactly one `200`
@@ -431,7 +441,7 @@ plus a deterministic twin that forces the stale read.
 |---|---|---|
 | 1 | Payment lifecycle, state machine, PostgreSQL, OpenAPI, Docker | Done |
 | 2 | Idempotency, unique constraints, optimistic locking, concurrency tests | **In progress**: idempotent create and concurrent capture done; required key and expiry sweep next |
-| 3 | Processor simulator, timeouts, retry, circuit breaker, bulkhead (`v0.1`) | **In progress**: simulator, authorisation, timeouts, bounded retry and circuit breaker done; bulkhead next |
+| 3 | Processor simulator, timeouts, retry, circuit breaker, bulkhead (`v0.1`) | **In progress**: simulator, authorisation, timeouts, bounded retry, circuit breaker and bulkhead done; ADR-008 in full and the `v0.1` tag next |
 | 4 | Kafka, transactional outbox, ledger service, idempotent consumers (`v0.2`) | Scaffolded (no runnable logic) |
 | 5 | Redis cache and idempotency acceleration, measured | Not started |
 | 6 | OpenTelemetry, Prometheus, Grafana, structured logging | Not started |

@@ -132,6 +132,77 @@ fallback that answered "approved" would ship goods for a payment nobody authoris
   period the transitions aren't there any more. The metrics endpoint (`resilience4j_circuitbreaker_*`
   in Prometheus) is the durable record.
 
+## Bulkhead (added 2026-11-13)
+
+**Why it's here as well as a timeout.** A timeout bounds *one* call. A bulkhead bounds *how many*
+can be in flight at once. A processor that answers in 1.5s triggers no timeout, no error and no
+breaker, yet every payment holds a request thread for those 1.5s. With 200 Tomcat threads and enough
+incoming payments, all 200 end up waiting on the processor, and reads that never touch it queue
+behind them.
+
+**Decision.** `maxConcurrentCalls: 20`, `maxWaitDuration: 0`, around the whole create-and-authorise
+path, taken before anything is written. A request that finds it full gets `503` with
+`Retry-After: 1`, and nothing is created, the same contract as an open breaker. Replays need no
+processor and no permit, so they are never refused. 20 is a tenth of Tomcat's threads: capacity is
+about 160 payments/s at the normal 120ms and about 13/s at 1.5s. Not waiting is deliberate, because
+a request waiting for a permit still holds its thread.
+
+**Evidence (real stack, processor `SLOW` at 1.5s, 300 clients flooding `POST /payments` for 15s,
+`GET /payments/{id}` timed every 100ms):**
+
+| Run | Successful payments | Read p50 / p95 |
+|---|---|---|
+| No flood (baseline) | n/a | 24 / 35 ms |
+| Bulkhead 20, clients honour `Retry-After` | 200 | **16 / 61 ms** |
+| Bulkhead 20, clients retry instantly | 200 | 274 / 382 ms |
+| No bulkhead | 2,067 | **836 / 1,119 ms** |
+| No bulkhead, virtual threads | 2,866 | 11 / 51 ms |
+
+- **200 successes** is the bulkhead doing exactly its arithmetic: 20 permits × 15s / 1.5s.
+- **Clients retrying instantly** sent about 1,000 requests a second at the service, all refused. Reads
+  slowed because the refusals themselves cost CPU. That's a client misbehaving, not the bulkhead
+  failing, and it's why the `503` carries `Retry-After`.
+- **Virtual threads** fix thread exhaustion on their own: reads stayed fast with no bulkhead. They do
+  not bound anything else. All 300 calls went to the processor at once, more than ten times what the
+  bulkhead allows. Against a real processor, that is the load that turns slow into down, and the
+  breaker would then see it. Virtual threads make waiting cheap; they don't make the dependency, the
+  database pool or the processor's capacity any bigger. The bulkhead stays.
+
+`BulkheadIT` proves the cap and the refusal with MockMvc: the processor never sees more than 20 at
+once, and refusals take well under a permitted call's time. MockMvc has no Tomcat thread pool, so the
+thread-exhaustion half is only shown by the measurement above.
+
+## One attempt row per processor request id (added 2026-11-13)
+
+**Why.** A retry sends the same request id, and the processor treats it as the same authorisation:
+at most one charge, however many calls it took. A row per call recorded one authorisation as several,
+and a duplicated answer, the processor delivering one result twice, as two attempts.
+
+**Decision.** `payment_attempts` has one row per (payment, operation, `processor_request_id`),
+enforced by a unique constraint (V3 migration). A retry counts the call (`call_count`) on that row,
+committed before the call, so a crash mid-retry still leaves it `PENDING`. This reverses Day 15's
+"one row per call".
+
+**What it gives up.** The outcome of each failed call before the last. The row keeps the final
+outcome, the last call's latency and the call count. The earlier calls' outcomes are in the logs
+only. Rows written before V3 were one per call; they carry `pre-v3:<id>` as their request id rather
+than a guess.
+
+**Evidence.** The simulator's `DUPLICATE_RESPONSE` authorises, sends half the answer and closes the
+connection; a retry with the same id gets the same answer whole. On the real stack, three payments
+each produced one attempt row with `call_count` 2: two `AUTHORIZED` with one authorisation id each,
+and one `FAILED` from the simulator's 5% decline rate, whose decline was also delivered twice and
+recorded once. `PaymentControllerIT` covers it through HTTP, and also shows the database refusing a
+second row for the same request id.
+
+**Found on the real stack, not by the tests.** The first `DUPLICATE_RESPONSE` threw an exception after
+the half body, expecting Tomcat to drop the connection. It didn't: Spring Boot's error handling
+appended its own JSON, and the client got a complete, garbled body, which it correctly called
+`MALFORMED_RESPONSE` and didn't retry. The tests passed because the in-process fake processor closes
+its connections differently. The simulator now declares the full length, sends half and asks Tomcat
+to close the connection. The client also now classifies a body cut off mid-read as a broken
+connection (retryable), separately from a body that arrived whole and made no sense (not retryable).
+
 ## Status of the pieces
 
 | Piece | State |
@@ -142,3 +213,7 @@ fallback that answered "approved" would ship goods for a payment nobody authoris
 | Simulator `INTERMITTENT` with a settable rate | Built (`?mode=INTERMITTENT&failureRate=0.05`) |
 | Slow-call threshold | Not set, deliberately. It needs measured percentiles |
 | Thresholds revisited under real load | Phase 8 |
+| Bulkhead (20, no wait), `503` with nothing created | Built, tested (unit, `BulkheadIT`), measured on the real stack |
+| One attempt row per processor request id | Built (V3), tested, shown on the real stack with `DUPLICATE_RESPONSE` |
+| Simulator `OUTAGE` | Built: `503` for 30s, then back to `NORMAL` by itself. Drove the breaker's full lifecycle on the real stack with no second curl |
+| The whole of ADR-008: all five Resilience4j patterns in one place | Day 18 |
