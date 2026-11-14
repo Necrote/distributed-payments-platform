@@ -144,6 +144,7 @@
              2026-10-30  Day 14          130/156 killed = 83%  (test strength 98%)
              2026-11-02  Day 15          158/187 killed = 84%  (test strength 96%)
              2026-11-05  Day 16          172/202 killed = 85%  (test strength 96%)
+             2026-11-13  Day 17          187/217 killed = 86%  (test strength 96%)
            Day 14 first measured 112/156 = 72% and failed the gate: the new authorisation halves of
            PaymentApplicationService were integration-tested only. PaymentApplicationServiceTest
            covers them at unit level now.
@@ -151,7 +152,8 @@
            the condition around a log line (two mutants), Resilience4j's metrics-only onComplete,
            a nanosecond boundary on the deadline, and a failure == null mutant whose NPE is caught
            and ends the same way; in IdempotentPaymentCreator, a mutant that looks up a null key
-           when the breaker is open, which finds nothing and ends in the same 503.
+           when the breaker is open or the bulkhead full, which finds nothing and ends in the same
+           503.
            The gate is the measured whole percentage. PIT rounds before comparing, so a lost kill
            can pass if the score still rounds to the gate: read the score, not only the build.
            Proven: @Disabled on PaymentAuthorizerTest fails the build. Raise it when the score rises; never lower it to make a red build
@@ -185,7 +187,7 @@
             <mutator>REMOVE_CONDITIONALS</mutator>
           </mutators>
           <timestampedReports>false</timestampedReports>
-          <mutationThreshold>85</mutationThreshold>
+          <mutationThreshold>86</mutationThreshold>
           <!-- <failWhenNoMutations>true</failWhenNoMutations> -->
         </configuration>
       </plugin>
