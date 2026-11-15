@@ -143,6 +143,21 @@ class CircuitBreakerIT {
     }
 
     @Test
+    void nobodyCanForceTheBreakerOpenOrOffThroughTheActuator() throws Exception {
+        // Exposing the endpoint for the demo also exposed its write operation, unauthenticated.
+        // FORCE_OPEN would refuse every payment; DISABLE would switch the breaker off.
+        for (String state : new String[] {"FORCE_OPEN", "DISABLE", "CLOSE"}) {
+            mockMvc.perform(post("/actuator/circuitbreakers/processor")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"updateState\":\"" + state + "\"}"))
+                    .andExpect(status().isMethodNotAllowed());
+        }
+        assertThat(breaker().getState()).isEqualTo(CircuitBreaker.State.CLOSED);
+        // Reading still works.
+        mockMvc.perform(get("/actuator/circuitbreakers")).andExpect(status().isOk());
+    }
+
+    @Test
     void aReplayStillWorksWhileTheBreakerIsOpen() throws Exception {
         String merchant = "merchant-" + UUID.randomUUID();
         String key = "key-" + UUID.randomUUID();
