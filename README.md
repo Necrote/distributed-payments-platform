@@ -96,38 +96,8 @@ curl -X POST http://localhost:8080/payments -H 'Content-Type: application/json' 
   -d '{"merchantId":"m","amount":1,"currency":"XYZ","paymentMethodToken":"t"}'   # 400, names the field
 ```
 
-Make the processor misbehave with one curl, then create another payment and read the response:
-
-```bash
-curl -X PUT 'http://localhost:8081/control/mode?mode=SLOW'
-```
-
-| Mode | Response | Payment | Attempt (`payment_attempts`) | Why |
-|---|---|---|---|---|
-| `NORMAL` | `201` | `AUTHORIZED` | `SUCCESS` | Approved |
-| `HTTP_429` | `201` | `FAILED` | `FAILURE`, `HTTP_429` | Refused, so no money moved |
-| `HTTP_500` | `504` | `PROCESSING` | `UNKNOWN`, `HTTP_500` | It may have failed before the charge or after it |
-| `SLOW`, `TIMEOUT` | `504` in ~2s | `PROCESSING` | `TIMEOUT`, `READ_TIMEOUT` | We stop waiting at 2s, and the charge may still happen |
-| `INTERMITTENT` (`&failureRate=0.05`) | mostly `201`, about 1 in 20 `504` | as above | as above | Background noise. The circuit breaker must ignore it, and does |
-| `DUPLICATE_RESPONSE` | `201` | `AUTHORIZED` | One row, `call_count` 2 | The answer is cut off, the retry gets it again: one authorisation, one attempt |
-| `OUTAGE` | `504`, then `503`, then `201` | as above | as above | `503` for 30s, then recovers by itself. The breaker opens, probes and closes with no second curl |
-| `SLOW&latency=1500ms`, flooded | `201` for 20 at a time, the rest `503` at once | `AUTHORIZED` | `SUCCESS` | The bulkhead: reads stay fast because payments can't take every thread |
-| simulator stopped | `201` in ~2s, then `503` | `FAILED`, then none | One row each, `call_count` 3, `CONNECT_FAILED` | Retried, then after 10 failed calls the circuit breaker opens |
-
-The `504` names the payment and says not to create a new one: fetch it instead. The `503` means the
-circuit breaker is open or too many payments are already waiting on the processor: nothing was
-created or charged, so retry after `Retry-After` with the same key.
-
-Watch the breaker while you do this:
-
-```bash
-curl -X PUT 'http://localhost:8081/control/mode?mode=HTTP_500'   # then create 10 payments
-curl http://localhost:8080/actuator/circuitbreakers              # CLOSED -> OPEN
-curl -X PUT 'http://localhost:8081/control/mode?mode=NORMAL'     # wait 10s: OPEN -> HALF_OPEN
-curl http://localhost:8080/actuator/circuitbreakerevents/processor   # three probes later: CLOSED
-```
-
-Why it opens at those numbers and not others is in [ADR-008](docs/adr/0008-circuit-breaker-thresholds.md).
+To make the processor misbehave on purpose - slow, failing, duplicating, down - see
+[Failure handling](#failure-handling): one curl per failure mode.
 
 Every error is an RFC 7807 `application/problem+json` body. The full API is at
 <http://localhost:8080/swagger-ui.html>. On Windows PowerShell, `curl` is an alias for
@@ -292,18 +262,71 @@ sequenceDiagram
 
 ## Failure handling
 
+Every processor failure this service handles can be reproduced on the running stack with one curl:
+flip the simulator's mode, then create a payment. Why each is handled the way it is - and which
+resilience patterns were deliberately *not* used - is in
+[ADR-008](docs/adr/0008-processor-resilience.md).
+
+### Reproduce it
+
+Two helpers, in bash (Git Bash on Windows): `pay` creates a payment and prints the status and time;
+`attempts` shows the latest rows of `payment_attempts`.
+
+```bash
+PAY='{"merchantId":"demo","amount":12500,"currency":"INR","paymentMethodToken":"tok_test_123"}'
+pay() { curl -s -w '  -> HTTP %{http_code} in %{time_total}s\n' -X POST http://localhost:8080/payments -H 'Content-Type: application/json' -d "$PAY"; }
+attempts() { docker exec dpp-postgres psql -U payments -d payments -c "SELECT outcome, error_code, call_count, latency_ms FROM payment_attempts ORDER BY created_at DESC LIMIT 3"; }
+fresh() { curl -s -X PUT 'http://localhost:8081/control/mode?mode=NORMAL' >/dev/null; sleep 11; for i in $(seq 20); do pay >/dev/null; done; }
+```
+
+Then, for each mode, run the curl, then `pay`, then `attempts`. **Run `fresh` between rows.** The
+circuit breaker judges the last 20 calls, so failures from one row count towards the next: run the
+table straight through and the breaker opens partway, exactly as designed. `fresh` resets the
+simulator and waits out an open breaker, then fills the window with 20 successes (about 15s).
+
+| Failure | One curl | What you'll see |
+|---|---|---|
+| Processor refuses (rate limit) | `curl -X PUT 'http://localhost:8081/control/mode?mode=HTTP_429'` | `201`, `"status":"FAILED"`; attempt `FAILURE`, `HTTP_429`. Refused, so no money moved |
+| Processor errors | `curl -X PUT 'http://localhost:8081/control/mode?mode=HTTP_500'` | `504`, names the payment; attempt `UNKNOWN`, `HTTP_500`, not retried. It may have failed before the charge or after it |
+| Processor never answers | `curl -X PUT 'http://localhost:8081/control/mode?mode=TIMEOUT'` | `504` after ~2s; attempt `TIMEOUT`, `READ_TIMEOUT`; payment stays `PROCESSING`, never `FAILED` |
+| Processor too slow | `curl -X PUT 'http://localhost:8081/control/mode?mode=SLOW'` | The same `504` after ~2s: the same outcome, a different cause. The processor will still approve, 10s later |
+| Background noise | `curl -X PUT 'http://localhost:8081/control/mode?mode=INTERMITTENT&failureRate=0.05'` | Run `for i in $(seq 40); do pay; done`: about 1 in 20 is a `504`, and the breaker stays `CLOSED` |
+| Answer delivered twice | `curl -X PUT 'http://localhost:8081/control/mode?mode=DUPLICATE_RESPONSE'` | `201`, `AUTHORIZED`; **one** attempt row with `call_count` 2: the answer was cut off, the retry got it again |
+| Processor fails, keeps failing | `curl -X PUT 'http://localhost:8081/control/mode?mode=HTTP_500'` | Run `for i in $(seq 10); do pay; done`, then `pay`: the 11th is a `503` in milliseconds with `Retry-After: 10`, and nothing was created. The breaker is `OPEN` |
+| Processor recovers | `curl -X PUT 'http://localhost:8081/control/mode?mode=NORMAL'` | After 10s the breaker goes `HALF_OPEN` on its own; three payments later, `CLOSED` |
+| An outage that ends by itself | `curl -X PUT 'http://localhost:8081/control/mode?mode=OUTAGE'` | Run `for i in $(seq 45); do pay; sleep 1; done`: `504`s, then `503`s once the breaker opens, then `201`s. 30s of `503` from the processor, then it recovers with no second curl |
+| Processor slow, flooded | `curl -X PUT 'http://localhost:8081/control/mode?mode=SLOW&latency=1500ms'` | Flood it (below): 20 at a time get `201` (about 100 across the flood), the rest `503` at once. The bulkhead holds 20 in flight, so reads stay fast |
+| Processor down | `docker compose stop processor-simulator` | `201`, `FAILED` in up to ~2s; one attempt with `call_count` 3, `CONNECT_FAILED`. After about 4 payments, `503`. Bring it back with `docker compose start processor-simulator` |
+
+Back to normal at any point with `curl -X PUT 'http://localhost:8081/control/mode?mode=NORMAL'`. If the
+breaker is open, give it 10s. Watch it with `curl http://localhost:8080/actuator/circuitbreakers` and
+`curl http://localhost:8080/actuator/circuitbreakerevents/processor`.
+
+The flood for the bulkhead row: 300 payments at once, counted by status.
+
+```bash
+seq 300 | xargs -P 300 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/payments -H 'Content-Type: application/json' -d "$PAY" | sort | uniq -c
+```
+
+The `504` says the payment may or may not have been charged, names it, and says not to create a new
+one. The `503` means the breaker is open or too many payments are already waiting on the processor:
+nothing was created or charged, so retry after `Retry-After` with the same key. A decline can't be
+forced, but `NORMAL` declines about 5% on purpose: a `201` with `"status":"FAILED"`.
+
+### Every failure, and where it's proven
+
 | Failure | What happens                                                                     | Where it is demonstrated |
 |---|----------------------------------------------------------------------------------|---|
 | Client retries the same request | Same payment returned, no second charge                                          | `PaymentControllerIT`, `PaymentApplicationServiceIT` |
 | Same key, different payload | `422`, never a silent replay of a different amount                               | `PaymentControllerIT.sameIdempotencyKeyWithDifferentPayloadIsRejected` |
 | Two concurrent captures | One wins on the optimistic-lock version, the other gets `409`, never retried     | `PaymentControllerIT`, `PaymentApplicationServiceIT` (20 runs each) |
 | Processor declines | `FAILED`, decline code recorded, a `201`. A return value, not an exception, so a breaker can't count it | `PaymentControllerIT`, `ProcessorClientTest` |
-| Processor slow | A timeout bounds each wait; the bulkhead caps payments in flight at 20, so reads keep their threads (p95 61 ms under a flood, vs 1,119 ms without it) | `ProcessorClientTest`, `BulkheadIT`, [ADR-008](docs/adr/0008-circuit-breaker-thresholds.md) |
+| Processor slow | A timeout bounds each wait; the bulkhead caps payments in flight at 20, so reads keep their threads (p95 61 ms under a flood, vs 1,119 ms without it) | `ProcessorClientTest`, `BulkheadIT`, [ADR-008](docs/adr/0008-processor-resilience.md) |
 | Processor answers twice | One authorisation, one attempt row: a retry with the same request id counts the call, and the database refuses a second row | `PaymentControllerIT.aDuplicatedAnswerIsOneAttemptWithOneAuthorisation` |
 | Processor returning 500 | `504`, attempt `UNKNOWN`, payment stays `PROCESSING`, not retried; counted by the circuit breaker | `ProcessorClientTest`, `PaymentAuthorizerTest` |
 | Processor times out | `504` in ~2s, attempt `TIMEOUT`, payment stays `PROCESSING`, never `FAILED` (built); reconciliation (*Phase 3*) | `PaymentControllerIT.processorTimeoutIsABounded504AndTheAttemptIsTimeoutNotFailure` |
 | Connection refused or broken | Up to 3 attempts inside a total deadline, backoff with jitter, same request id every time, one attempt row with the calls counted | `PaymentAuthorizerTest`, `PaymentControllerIT` |
-| Processor down, or mostly failing | After 10 failed calls (50% of a 20-call window) the breaker opens: `503` in milliseconds, nothing created. It probes itself after 10s | `CircuitBreakerIT.theFullLifecycle`, [ADR-008](docs/adr/0008-circuit-breaker-thresholds.md) |
+| Processor down, or mostly failing | After 10 failed calls (50% of a 20-call window) the breaker opens: `503` in milliseconds, nothing created. It probes itself after 10s | `CircuitBreakerIT.theFullLifecycle`, [ADR-008](docs/adr/0008-processor-resilience.md) |
 | A realistic 5% error rate | The breaker stays closed: zero trips in 100,000 simulated calls, and none in 200 real payments | `CircuitBreakerIT.productionThresholdsIgnore5PercentNoiseButOpenOnARealOutage` |
 | Kafka down | Payments still succeed; the outbox drains when the broker returns                | *Phase 4* |
 | Duplicate Kafka delivery | `processed_events` makes the second delivery a no-op                             | *Phase 4* |
@@ -387,13 +410,13 @@ plus a deterministic twin that forces the stale read.
   same request id on every call, and a total deadline. A read timeout uses up that deadline, so the
   client gets a `504` in ~2s rather than ~6.6s. Declines, `4xx` and `5xx` are never retried.
 - A circuit breaker on every processor call, with thresholds chosen against a 5% background error
-  rate ([ADR-008](docs/adr/0008-circuit-breaker-thresholds.md)). An open breaker answers `503` with
+  rate ([ADR-008](docs/adr/0008-processor-resilience.md)). An open breaker answers `503` with
   `Retry-After` before anything is written, and probes the processor on its own. Its state is at
   `/actuator/circuitbreakers`.
 - A bulkhead: at most 20 payments creating and authorising at once. The rest get `503` immediately,
   before anything is written, so a slow processor can't take every request thread. Measured: reads
   under a 300-client flood stay as fast as with no flood. Why a bulkhead still matters with virtual
-  threads is in [ADR-008](docs/adr/0008-circuit-breaker-thresholds.md).
+  threads is in [ADR-008](docs/adr/0008-processor-resilience.md).
 - `processor-simulator`, switchable at runtime with one curl: `/authorize` handles all eight modes,
   `NORMAL`, `SLOW` (with a settable latency), `TIMEOUT`, `HTTP_500`, `HTTP_429`, `INTERMITTENT` (with a
   settable failure rate), `DUPLICATE_RESPONSE` and `OUTAGE`, and answers a repeated request id with its
@@ -425,8 +448,11 @@ plus a deterministic twin that forces the stale read.
 - **Concurrency is proven for capture only.** Two simultaneous captures give exactly one `200`
   and one `409`, and the test fails if `@Version` is removed. Refund takes the same path but has
   no race test of its own yet.
-- No auth, no Redis, no metrics dashboards, no Kubernetes, no load-test numbers. Nothing on this
-  page is a performance claim.
+- **No auth.** Anyone who can reach port 8080 can call the API and read the actuator. The actuator is
+  read-only as a stopgap: exposing `circuitbreakers` had also exposed a write operation that let
+  anyone force the breaker open or switch it off, so every non-`GET` under `/actuator` now gets `405`.
+- No Redis, no metrics dashboards, no Kubernetes, no load-test numbers. Nothing on this page is a
+  performance claim beyond the measured runs in ADR-008, which were on one laptop.
 
 **Deliberately out of scope - known limitations, not oversights**
 

@@ -9,4 +9,4 @@ ones.
 |---|---|---|
 | [004](0004-idempotency-keys.md) | Idempotency keys enforced by a database unique constraint, not a cache | Accepted · revised 2026-10-22 |
 | [006](0006-payment-state-machine.md) | The payment lifecycle is an explicit state machine with one door; races settled by an optimistic version | Accepted |
-| [008](0008-circuit-breaker-thresholds.md) | Circuit breaker thresholds chosen against a 5% background error rate; an open breaker fails fast and creates nothing | Accepted |
+| [008](0008-processor-resilience.md) | Processor resilience: timeouts, bounded retry, circuit breaker and bulkhead, in that order of nesting; the rate limiter deliberately skipped; failures answered with errors, never invented outcomes | Accepted · rewritten 2026-11-15 |

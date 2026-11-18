@@ -114,7 +114,7 @@ resilience4j:
           - com.vivekpatel.payments.processor.ProcessorException$ConnectFailed
           - com.vivekpatel.payments.processor.ProcessorException$TimedOut
           - com.vivekpatel.payments.processor.ProcessorException$ConnectionBroken
-  # Every value below is argued in docs/adr/0008-circuit-breaker-thresholds.md, with the numbers.
+  # Every value below is argued in docs/adr/0008-processor-resilience.md, with the numbers.
   # In short: at a realistic 5% background error rate this never opens (0 trips in a simulated
   # million calls), and against a dead processor it opens after 10 calls.
   circuitbreaker:
