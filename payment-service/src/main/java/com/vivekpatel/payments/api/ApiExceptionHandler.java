@@ -4,7 +4,12 @@ import com.fasterxml.jackson.databind.JsonMappingException;
 import com.vivekpatel.payments.domain.IllegalStateTransitionException;
 import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
+import com.vivekpatel.payments.service.PaymentOutcomeUnknownException;
+import com.vivekpatel.payments.service.ProcessorUnavailableException;
+import com.vivekpatel.payments.service.TooManyPaymentsInFlightException;
+import java.time.Duration;
 import jakarta.servlet.http.HttpServletRequest;
+import java.net.URI;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
@@ -162,6 +167,64 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         body.setProperty("originalPaymentId", ex.getOriginalPaymentId());
         body.setProperty("differingFields", ex.getDifferingFields());
         return body;
+    }
+
+    /**
+     * The processor gave no usable answer, so the payment's outcome is unknown. 504 with the payment
+     * id, and a detail that says what to do, because the dangerous reaction to an error here is to
+     * pay again while the first charge may exist. A retry with the same key is safe and gets this
+     * answer again.
+     */
+    @ExceptionHandler(PaymentOutcomeUnknownException.class)
+    public ResponseEntity<ProblemDetail> handleOutcomeUnknown(PaymentOutcomeUnknownException ex) {
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.GATEWAY_TIMEOUT,
+                "The payment processor did not give a usable answer, so payment " + ex.getPaymentId()
+                        + " may or may not have been charged. Do not create a new payment. Fetch this "
+                        + "one to see its current status.");
+        body.setTitle("Payment outcome unknown");
+        body.setProperty("paymentId", ex.getPaymentId());
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(HttpStatus.GATEWAY_TIMEOUT)
+                .location(URI.create("/payments/" + ex.getPaymentId()));
+        if (ex.isReplayed()) {
+            response.header(PaymentController.REPLAYED_HEADER, "true");
+        }
+        return response.body(body);
+    }
+
+    /**
+     * The circuit breaker is open. 503 with {@code Retry-After}, and a detail that says the two
+     * things a client needs: nothing was created or charged, and the same key is safe to retry.
+     */
+    @ExceptionHandler(ProcessorUnavailableException.class)
+    public ResponseEntity<ProblemDetail> handleProcessorUnavailable(ProcessorUnavailableException ex) {
+        return refusedBeforeCreating(
+                "Payment processor unavailable",
+                "The payment processor is unavailable, so no payment was created and nothing was charged.",
+                ex.getRetryAfter());
+    }
+
+    /** The bulkhead is full. Same shape as the open breaker: nothing created, same key is safe. */
+    @ExceptionHandler(TooManyPaymentsInFlightException.class)
+    public ResponseEntity<ProblemDetail> handleTooManyInFlight(TooManyPaymentsInFlightException ex) {
+        return refusedBeforeCreating(
+                "Too many payments in progress",
+                "Too many payments are waiting on the payment processor right now, so this one was "
+                        + "not created and nothing was charged.",
+                ex.getRetryAfter());
+    }
+
+    private static ResponseEntity<ProblemDetail> refusedBeforeCreating(
+            String title, String whatHappened, Duration retryAfter) {
+        // Rounded up: telling a client to come back early only earns it another 503.
+        long seconds = Math.max(1, (retryAfter.toMillis() + 999) / 1000);
+        ProblemDetail body = ProblemDetail.forStatusAndDetail(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                whatHappened + " Retry after " + seconds + " seconds with the same Idempotency-Key.");
+        body.setTitle(title);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, String.valueOf(seconds))
+                .body(body);
     }
 
     /**

@@ -69,6 +69,8 @@ public class PaymentController {
      *       again - 200, not 201, because this call created nothing;</li>
      *   <li>{@code 422 Unprocessable Entity} when the same key arrives with a different payload.
      *       Never a silent replay: that would report success for an amount nobody charged.</li>
+     *   <li>{@code 504 Gateway Timeout} when the processor gave no usable answer. The payment exists
+     *       and stays {@code PROCESSING}; the body and {@code Location} name it.</li>
      * </ul>
      */
     @PostMapping
@@ -88,6 +90,21 @@ public class PaymentController {
             responseCode = "422",
             description = "Idempotency-Key already used with a different body; names the original "
                     + "payment and the `differingFields`",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @ApiResponse(
+            responseCode = "503",
+            description = "The processor's circuit breaker is open, or too many payments are already "
+                    + "waiting on it (the bulkhead). Nothing was created or charged; retry after "
+                    + "`Retry-After` seconds with the same Idempotency-Key",
+            content = @Content(
+                    mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
+                    schema = @Schema(implementation = ProblemDetail.class)))
+    @ApiResponse(
+            responseCode = "504",
+            description = "The processor gave no usable answer, so the payment may or may not be "
+                    + "charged. Names the `paymentId`: fetch it, and do not create a new payment",
             content = @Content(
                     mediaType = MediaType.APPLICATION_PROBLEM_JSON_VALUE,
                     schema = @Schema(implementation = ProblemDetail.class)))
@@ -158,8 +175,6 @@ public class PaymentController {
     public ResponseEntity<PaymentResponse> capturePayment(
             @PathVariable UUID paymentId,
             @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
-        // TODO Phase 3 (Day 13): there is no processor yet, so a payment only reaches AUTHORIZED
-        // through the admin-forced authorisation in AdminPaymentController.
         return ResponseEntity.ok(PaymentResponse.from(paymentService.capture(paymentId)));
     }
 

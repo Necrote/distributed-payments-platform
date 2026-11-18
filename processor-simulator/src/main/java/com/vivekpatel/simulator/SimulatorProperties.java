@@ -15,20 +15,31 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 @ConfigurationProperties(prefix = "simulator")
 public class SimulatorProperties {
 
-    /** Current behaviour. Changed at runtime via {@code PUT /control/mode}. */
-    private FailureMode mode = FailureMode.NORMAL;
+    /**
+     * Current behaviour. Changed at runtime via {@code PUT /control/mode}. Volatile because the
+     * write happens on one request thread and the reads on others; without it a flip to HTTP_500
+     * is not guaranteed to be seen by the next /authorize call.
+     */
+    private volatile FailureMode mode = FailureMode.NORMAL;
 
     /** Latency applied in {@link FailureMode#NORMAL}. */
     private Duration baseLatency = Duration.ofMillis(120);
 
-    /** Latency applied in {@link FailureMode#SLOW}. Tune it around the caller's read timeout. */
-    private Duration slowLatency = Duration.ofSeconds(10);
+    /**
+     * Latency applied in {@link FailureMode#SLOW}. Tune it around the caller's read timeout: above
+     * it gives timeouts, below it gives the slow-but-successful case nothing alerts on. Settable at
+     * runtime ({@code ?mode=SLOW&latency=1500ms}), hence volatile.
+     */
+    private volatile Duration slowLatency = Duration.ofSeconds(10);
 
     /** How long {@link FailureMode#TIMEOUT} sleeps before giving up on responding at all. */
     private Duration timeoutLatency = Duration.ofSeconds(60);
 
-    /** Fraction of calls that fail in {@link FailureMode#INTERMITTENT}, from 0.0 to 1.0. */
-    private double intermittentFailureRate = 0.3;
+    /**
+     * Fraction of calls that fail in {@link FailureMode#INTERMITTENT}, from 0.0 to 1.0. Volatile for
+     * the same reason as {@code mode}: the control endpoint changes it at runtime.
+     */
+    private volatile double intermittentFailureRate = 0.3;
 
     /** How long {@link FailureMode#OUTAGE} refuses calls before recovering on its own. */
     private Duration outageDuration = Duration.ofSeconds(30);

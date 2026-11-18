@@ -3,11 +3,15 @@ package com.vivekpatel.payments.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vivekpatel.payments.api.dto.PaymentResponse;
+import com.vivekpatel.payments.domain.AttemptOperation;
+import com.vivekpatel.payments.domain.AttemptOutcome;
 import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.domain.PaymentAttempt;
 import com.vivekpatel.payments.domain.PaymentStatus;
 import com.vivekpatel.payments.persistence.IdempotencyKeyRepository;
+import com.vivekpatel.payments.persistence.PaymentAttemptRepository;
 import com.vivekpatel.payments.persistence.PaymentRepository;
 import java.time.Clock;
 import java.time.Duration;
@@ -31,6 +35,7 @@ public class PaymentApplicationService {
 
     private final PaymentRepository payments;
     private final IdempotencyKeyRepository idempotencyKeys;
+    private final PaymentAttemptRepository attempts;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final Duration keyTtl;
@@ -38,11 +43,13 @@ public class PaymentApplicationService {
     public PaymentApplicationService(
             PaymentRepository payments,
             IdempotencyKeyRepository idempotencyKeys,
+            PaymentAttemptRepository attempts,
             ObjectMapper objectMapper,
             Clock clock,
             @Value("${payments.idempotency.key-ttl}") Duration keyTtl) {
         this.payments = payments;
         this.idempotencyKeys = idempotencyKeys;
+        this.attempts = attempts;
         this.objectMapper = objectMapper;
         this.clock = clock;
         this.keyTtl = keyTtl;
@@ -139,8 +146,9 @@ public class PaymentApplicationService {
      */
     @Transactional
     public Payment capture(UUID paymentId) {
-        // TODO Phase 3 (Day 13): call the processor's capture first and record a payment_attempts
-        // row. Until then the transition is the whole operation.
+        // TODO Phase 3: call the processor's capture and record a payment_attempts row,
+        // split around the call the same way as authorisation. Until then the transition is the
+        // whole operation.
         Payment payment = load(paymentId);
         payment.transitionTo(PaymentStatus.CAPTURED, clock);
         return payment;
@@ -164,19 +172,81 @@ public class PaymentApplicationService {
     }
 
     /**
-     * Admin-forced authorisation: {@code CREATED -> PROCESSING -> AUTHORIZED} with no processor
-     * involved. It exists only so capture is reachable before Phase 3, and it still goes through
-     * the state machine one step at a time.
+     * The first half of an authorisation: {@code CREATED -> PROCESSING}, and a {@code PENDING}
+     * attempt row, committed together <b>before</b> the processor is called.
      *
-     * <p>TODO Phase 3 (Day 13): delete this, and {@code AdminPaymentController}, once the
-     * processor simulator performs real authorisations.
+     * <p>Committed first so that a crash during the call leaves evidence: a payment in
+     * {@code PROCESSING} with a {@code PENDING} attempt says "a request may have reached the
+     * processor", which is exactly what reconciliation needs to know.
+     *
+     * <p>The state machine also makes this the gate against double authorisation. Only a
+     * {@code CREATED} payment can enter {@code PROCESSING}, and the version column settles a race
+     * between two callers, so at most one authorisation per payment ever reaches the processor.
+     *
+     * @throws PaymentNotFoundException if no payment has this id.
+     * @throws com.vivekpatel.payments.domain.IllegalStateTransitionException if it is not
+     *     {@code CREATED}.
      */
     @Transactional
-    public Payment forceAuthorize(UUID paymentId) {
+    public AuthorizationStarted startAuthorization(UUID paymentId, String processorRequestId) {
         Payment payment = load(paymentId);
         payment.transitionTo(PaymentStatus.PROCESSING, clock);
-        payment.transitionTo(PaymentStatus.AUTHORIZED, clock);
+        int attemptNumber =
+                Math.toIntExact(attempts.countByPaymentIdAndOperation(paymentId, AttemptOperation.AUTHORIZE)) + 1;
+        PaymentAttempt attempt = attempts.save(PaymentAttempt.start(
+                paymentId, attemptNumber, AttemptOperation.AUTHORIZE, processorRequestId, clock));
+        return new AuthorizationStarted(payment, attempt.getId());
+    }
+
+    /**
+     * A retry's bookkeeping: the same request id is about to be sent again, so it is the same
+     * attempt, and this counts the call on its row instead of adding one. Committed before the call
+     * so a crash mid-retry still leaves the row {@code PENDING}. The payment does not move.
+     */
+    @Transactional
+    public void recordAnotherCall(UUID attemptId) {
+        loadAttempt(attemptId).recordAnotherCall();
+    }
+
+    /**
+     * The second half: record how the last call ended, and move the payment if the outcome says where
+     * to - see {@link AttemptOutcome#paymentStatusAfterAuthorization()}. On a timeout or an unknown
+     * outcome the payment stays {@code PROCESSING}.
+     *
+     * <p>If the payment was created with an {@code Idempotency-Key}, the stored response is
+     * replaced with the one this request is about to return. A replay is the original response
+     * (ADR-004), and the original response is the payment after authorisation, not the
+     * {@code CREATED} snapshot written by {@link #create}. When the outcome is unknown that response
+     * is a {@code 504}, and the stored status says so, so that a retry gets a 504 too.
+     *
+     * <p>If this transaction fails after the processor approved - the database is down, say - the
+     * charge exists and this service does not know it: the payment stays {@code PROCESSING} and the
+     * attempt stays {@code PENDING}. That pair is what reconciliation looks for. It is the
+     * dual-write problem, and it cannot be closed from inside one service.
+     */
+    @Transactional
+    public Payment completeAuthorization(
+            UUID attemptId, AttemptResult result, Duration latency, String idempotencyKey) {
+        PaymentAttempt attempt = loadAttempt(attemptId);
+        attempt.complete(result.outcome(), result.processorReference(), result.errorCode(), latency);
+
+        Payment payment = load(attempt.getPaymentId());
+        Optional<PaymentStatus> target = result.outcome().paymentStatusAfterAuthorization();
+        target.ifPresent(status -> payment.transitionTo(status, clock));
+
+        if (idempotencyKey != null) {
+            HttpStatus responseStatus = target.isPresent() ? HttpStatus.CREATED : HttpStatus.GATEWAY_TIMEOUT;
+            // Through the unique index on (merchant_id, idempotency_key); payment_id has no index.
+            idempotencyKeys.findByMerchantIdAndIdempotencyKey(payment.getMerchantId(), idempotencyKey)
+                    .ifPresent(key -> key.recordResponse(
+                            payment.getId(), responseStatus.value(), responseBody(payment)));
+        }
         return payment;
+    }
+
+    private PaymentAttempt loadAttempt(UUID attemptId) {
+        return attempts.findById(attemptId)
+                .orElseThrow(() -> new IllegalStateException("No payment attempt with id " + attemptId));
     }
 
     /**

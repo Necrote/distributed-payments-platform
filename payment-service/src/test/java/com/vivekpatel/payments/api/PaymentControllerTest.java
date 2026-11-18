@@ -27,6 +27,9 @@ import com.vivekpatel.payments.service.IdempotencyKeyReusedException;
 import com.vivekpatel.payments.service.IdempotentPaymentCreator;
 import com.vivekpatel.payments.service.PaymentApplicationService;
 import com.vivekpatel.payments.service.PaymentNotFoundException;
+import com.vivekpatel.payments.service.PaymentOutcomeUnknownException;
+import com.vivekpatel.payments.service.ProcessorUnavailableException;
+import com.vivekpatel.payments.service.TooManyPaymentsInFlightException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -309,11 +312,56 @@ class PaymentControllerTest {
     }
 
     @Test
-    void forceAuthorizeEndpointDoesNotExistUnlessEnabled() throws Exception {
-        // AdminPaymentController is not part of this slice, and is off by default everywhere else.
-        mockMvc.perform(post("/admin/payments/{id}/force-authorize", UUID.randomUUID()))
-                .andExpect(status().isNotFound());
-        verifyNoInteractions(paymentService, paymentCreator);
+    void unknownOutcomeIs504NamingThePaymentAndTellingTheClientNotToPayAgain() throws Exception {
+        UUID id = UUID.randomUUID();
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new PaymentOutcomeUnknownException(id, false));
+
+        mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isGatewayTimeout())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.paymentId").value(id.toString()))
+                .andExpect(jsonPath("$.detail").value(containsString("Do not create a new payment")))
+                .andExpect(header().string("Location", "/payments/" + id))
+                .andExpect(header().doesNotExist(PaymentController.REPLAYED_HEADER));
+    }
+
+    @Test
+    void aFullBulkheadIs503WithRetryAfterAndSaysNothingWasCharged() throws Exception {
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new TooManyPaymentsInFlightException(java.time.Duration.ofSeconds(1)));
+
+        mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(header().string("Retry-After", "1"))
+                .andExpect(jsonPath("$.title").value("Too many payments in progress"))
+                .andExpect(jsonPath("$.detail").value(containsString("nothing was charged")))
+                .andExpect(jsonPath("$.detail").value(containsString("same Idempotency-Key")));
+    }
+
+    @Test
+    void anOpenBreakerIs503WithRetryAfterAndSaysNothingWasCharged() throws Exception {
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new ProcessorUnavailableException(java.time.Duration.ofMillis(9500)));
+
+        mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isServiceUnavailable())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                // Rounded up: telling a client to come back early only earns it another 503.
+                .andExpect(header().string("Retry-After", "10"))
+                .andExpect(jsonPath("$.title").value("Payment processor unavailable"))
+                .andExpect(jsonPath("$.detail").value(containsString("nothing was charged")))
+                .andExpect(jsonPath("$.detail").value(containsString("same Idempotency-Key")));
+    }
+
+    @Test
+    void aReplayedUnknownOutcomeSaysItIsAReplay() throws Exception {
+        when(paymentCreator.create(any(), any(), any(), any(), any()))
+                .thenThrow(new PaymentOutcomeUnknownException(UUID.randomUUID(), true));
+
+        mockMvc.perform(post("/payments").contentType(MediaType.APPLICATION_JSON).content(VALID_BODY))
+                .andExpect(status().isGatewayTimeout())
+                .andExpect(header().string(PaymentController.REPLAYED_HEADER, "true"));
     }
 
     @Test

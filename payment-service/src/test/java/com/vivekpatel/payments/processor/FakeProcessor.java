@@ -1,0 +1,175 @@
+package com.vivekpatel.payments.processor;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+
+/**
+ * A processor on a real socket, in-process. Real HTTP, so the timeouts, status codes and body
+ * parsing in {@link ProcessorClient} are exercised for real - a mocked client would skip exactly
+ * the part that goes wrong in production.
+ *
+ * <p>Deliberately dumber than {@code processor-simulator}: one reply rule at a time, set by the
+ * test. Approves by default, echoing the request id like the real simulator does.
+ */
+public final class FakeProcessor implements AutoCloseable {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** What to send back for a request with this {@code requestId}. */
+    public record Reply(int status, String body, Duration delay) {
+    }
+
+    private final HttpServer server;
+    private final List<String> requestBodies = new CopyOnWriteArrayList<>();
+    private final AtomicInteger connectionsToBreak = new AtomicInteger();
+    private final AtomicInteger bodiesToCutOff = new AtomicInteger();
+    private final AtomicInteger inFlight = new AtomicInteger();
+    private final AtomicInteger mostInFlight = new AtomicInteger();
+    private final java.util.Map<String, String> approvalsByRequestId = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile Function<String, Reply> replies = this::approve;
+    private volatile Duration bodyStall = Duration.ZERO;
+
+    private FakeProcessor(HttpServer server) {
+        this.server = server;
+    }
+
+    public static FakeProcessor start() {
+        try {
+            HttpServer server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+            FakeProcessor fake = new FakeProcessor(server);
+            server.createContext("/authorize", fake::handle);
+            // One virtual thread per request: the default runs every request on one thread, which
+            // would serialise concurrent tests and make a slow reply block every other one.
+            server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+            server.start();
+            return fake;
+        } catch (IOException e) {
+            throw new IllegalStateException("Could not start the fake processor", e);
+        }
+    }
+
+    public String baseUrl() {
+        return "http://" + server.getAddress().getHostString() + ":" + server.getAddress().getPort();
+    }
+
+    public void approveAll() {
+        replies = this::approve;
+        connectionsToBreak.set(0);
+        bodiesToCutOff.set(0);
+        bodyStall = Duration.ZERO;
+        approvalsByRequestId.clear();
+        mostInFlight.set(0);
+    }
+
+    /**
+     * The next {@code count} responses are cut off halfway through the body. Approvals are kept
+     * per request id, so a retry of a cut-off request gets the same authorisation id again - the
+     * simulator's DUPLICATE_RESPONSE.
+     */
+    public void cutOffNextBodies(int count) {
+        bodiesToCutOff.set(count);
+    }
+
+    /** The most requests this fake has been handling at the same moment since the last reset. */
+    public int mostInFlight() {
+        return mostInFlight.get();
+    }
+
+    /** The next {@code count} requests are received, then the connection closes with no response. */
+    public void breakNextConnections(int count) {
+        connectionsToBreak.set(count);
+    }
+
+    /** Sends the headers at once, then holds the body back: the case a read timeout does not cover. */
+    public void stallBodyFor(Duration stall) {
+        bodyStall = stall;
+    }
+
+    public void declineAll(String declineCode) {
+        replies = requestId -> new Reply(200, """
+                {"requestId":"%s","status":"DECLINED","declineCode":"%s"}""".formatted(requestId, declineCode),
+                Duration.ZERO);
+    }
+
+    public void replyWith(int status, String body) {
+        replies = requestId -> new Reply(status, body, Duration.ZERO);
+    }
+
+    /** Approves, but only after {@code delay} - set it past the client's read timeout to time out. */
+    public void approveAfter(Duration delay) {
+        replies = requestId -> new Reply(200, approve(requestId).body(), delay);
+    }
+
+    public List<String> requestBodies() {
+        return List.copyOf(requestBodies);
+    }
+
+    private Reply approve(String requestId) {
+        String authorizationId = approvalsByRequestId.computeIfAbsent(requestId, id -> "auth_" + UUID.randomUUID());
+        return new Reply(200, """
+                {"requestId":"%s","authorizationId":"%s","status":"APPROVED","amount":12500,"currency":"INR"}"""
+                .formatted(requestId, authorizationId), Duration.ZERO);
+    }
+
+    private void handle(HttpExchange exchange) throws IOException {
+        int now = inFlight.incrementAndGet();
+        mostInFlight.accumulateAndGet(now, Math::max);
+        try {
+            respond(exchange);
+        } finally {
+            inFlight.decrementAndGet();
+        }
+    }
+
+    private void respond(HttpExchange exchange) throws IOException {
+        try (exchange) {
+            String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            requestBodies.add(body);
+            if (connectionsToBreak.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                return;
+            }
+            JsonNode requestId = JSON.readTree(body).get("requestId");
+            Reply reply = replies.apply(requestId == null ? "" : requestId.asText());
+            if (!reply.delay().isZero()) {
+                Thread.sleep(reply.delay());
+            }
+            byte[] bytes = reply.body().getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(reply.status(), bytes.length);
+            if (!bodyStall.isZero()) {
+                exchange.getResponseBody().flush();
+                Thread.sleep(bodyStall);
+            }
+            if (bodiesToCutOff.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                // Half the declared length, then close: the client reads a truncated body.
+                exchange.getResponseBody().write(bytes, 0, bytes.length / 2);
+                exchange.getResponseBody().flush();
+                return;
+            }
+            exchange.getResponseBody().write(bytes);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException e) {
+            // The client gave up (read timeout) and closed the connection before we answered.
+            // That is the scenario under test, not a failure of the fake.
+        }
+    }
+
+    @Override
+    public void close() {
+        server.stop(0);
+    }
+}

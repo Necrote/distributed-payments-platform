@@ -3,8 +3,10 @@ package com.vivekpatel.payments.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.vivekpatel.payments.domain.IllegalStateTransitionException;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.processor.FakeProcessor;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -17,6 +19,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -26,6 +29,8 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -46,6 +51,18 @@ class PaymentApplicationServiceIT {
     @ServiceConnection
     static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
 
+    static FakeProcessor processor = FakeProcessor.start();
+
+    @DynamicPropertySource
+    static void processorUrl(DynamicPropertyRegistry registry) {
+        registry.add("payments.processor.base-url", processor::baseUrl);
+    }
+
+    @AfterAll
+    static void stopProcessor() {
+        processor.close();
+    }
+
     private static final Money AMOUNT = Money.of(12500, "INR");
 
     @Autowired
@@ -53,6 +70,9 @@ class PaymentApplicationServiceIT {
 
     @Autowired
     IdempotentPaymentCreator creator;
+
+    @Autowired
+    PaymentAuthorizer authorizer;
 
     @Autowired
     TransactionTemplate tx;
@@ -196,7 +216,7 @@ class PaymentApplicationServiceIT {
     @RepeatedTest(20)
     void staleCaptureLosesOnTheVersionColumn() throws Exception {
         UUID id = service.create("merchant-race", AMOUNT, "tok", null, null).getId();
-        service.forceAuthorize(id);
+        authorizer.authorize(id, null);
 
         CyclicBarrier bothHaveRead = new CyclicBarrier(2);
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -229,10 +249,38 @@ class PaymentApplicationServiceIT {
             pool.shutdownNow();
         }
 
-        // create = 0, force-authorize = 1, the one capture that committed = 2.
+        // create = 0, -> PROCESSING = 1, -> AUTHORIZED = 2, the one capture that committed = 3.
         assertThat(jdbc.queryForMap("SELECT status, version FROM payments WHERE id = ?", id))
                 .containsEntry("status", "CAPTURED")
-                .containsEntry("version", 2L);
+                .containsEntry("version", 3L);
+    }
+
+    @Test
+    void authorizerRefusesToRunInsideAnExistingTransaction() {
+        // Inside a transaction, the processor call would hold a pooled connection for as long as
+        // the processor takes. NEVER turns that into an error at the first call, not an outage.
+        UUID id = service.create("m-never", AMOUNT, "tok", null, null).getId();
+
+        assertThatThrownBy(() -> tx.executeWithoutResult(status -> authorizer.authorize(id, null)))
+                .isInstanceOf(IllegalTransactionStateException.class);
+        assertThat(jdbc.queryForObject("SELECT status FROM payments WHERE id = ?", String.class, id))
+                .isEqualTo("CREATED");
+    }
+
+    @Test
+    void aPaymentIsAuthorizedOnceEvenIfAskedTwice() {
+        // startAuthorization is the gate: only CREATED may enter PROCESSING, so a second
+        // authorise of the same payment never reaches the processor.
+        UUID id = service.create("m-twice", AMOUNT, "tok", null, null).getId();
+        authorizer.authorize(id, null);
+        int callsBefore = processor.requestBodies().size();
+
+        assertThatThrownBy(() -> authorizer.authorize(id, null))
+                .isInstanceOf(IllegalStateTransitionException.class);
+        assertThat(processor.requestBodies()).hasSize(callsBefore);
+        assertThat(jdbc.queryForObject(
+                        "SELECT count(*) FROM payment_attempts WHERE payment_id = ?", Long.class, id))
+                .isOne();
     }
 
     private static void awaitQuietly(CyclicBarrier barrier) {

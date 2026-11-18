@@ -7,10 +7,11 @@ Java 21 · Spring Boot 3 · PostgreSQL · Kafka · Redis · Kubernetes · Resili
 
 [![ci](https://github.com/Necrote/distributed-payments-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/Necrote/distributed-payments-platform/actions/workflows/ci.yml)
 
-> **Status: Phase 2 in progress.** `payment-service` runs end to end in Docker: create, fetch,
+> **Status: Phase 3 in progress.** `payment-service` runs end to end in Docker: create, fetch,
 > capture and refund through an enforced state machine, on PostgreSQL, tested in CI against a real
-> PostgreSQL. `POST /payments` is idempotent: a retry replays, a reused key with a different body
-> is a `422`. The processor integration, Kafka and the ledger are **not built yet**.
+> PostgreSQL. `POST /payments` is idempotent, and it authorises each new payment with the
+> processor simulator, with bounded latency, bounded retries, a circuit breaker and a bulkhead,
+> recording every attempt. **Reconciliation, Kafka and the ledger are not built yet.**
 > The rest of this README describes the target design; [the roadmap](#roadmap-and-honest-status)
 > says exactly which parts are real today.
 
@@ -39,8 +40,10 @@ You need Docker. Nothing else - the image builds the service with its own JDK an
 ```bash
 git clone https://github.com/Necrote/distributed-payments-platform.git
 cd distributed-payments-platform
-docker compose up -d --build --wait     # PostgreSQL + payment-service; returns once both are healthy
+docker compose up -d --build --wait     # PostgreSQL, payment-service, processor-simulator; returns once all are healthy
 ```
+
+Ports on your machine: the API is on `8080`, the simulator on `8081`, and PostgreSQL on `15432`.
 
 Create a payment (amounts are minor units - `12500 INR` is ₹125.00):
 
@@ -55,8 +58,11 @@ curl -i -X POST http://localhost:8080/payments \
 HTTP/1.1 201
 Location: http://localhost:8080/payments/e440f939-9c4b-40ea-bdc6-8372845dea64
 
-{"id":"e440f939-...","merchantId":"merchant-123","amount":12500,"currency":"INR","status":"CREATED",...}
+{"id":"e440f939-...","merchantId":"merchant-123","amount":12500,"currency":"INR","status":"AUTHORIZED",...}
 ```
+
+The simulator declines about 5% of authorisations on purpose, so you may occasionally see
+`"status":"FAILED"`. A decline is a business outcome, so it's still a `201`.
 
 Send the exact same request again: `200`, the same payment, `Idempotent-Replayed: true`, and no
 second row. Now reuse the key with a different amount:
@@ -84,10 +90,14 @@ Then try the other things that should fail, and see how they fail:
 
 ```bash
 curl http://localhost:8080/payments/<id>                     # 200, the payment
-curl -X POST http://localhost:8080/payments/<id>/capture     # 409: CREATED cannot move to CAPTURED
+curl -X POST http://localhost:8080/payments/<id>/capture     # 200, CAPTURED
+curl -X POST http://localhost:8080/payments/<id>/capture     # 409: CAPTURED cannot move to CAPTURED
 curl -X POST http://localhost:8080/payments -H 'Content-Type: application/json' \
   -d '{"merchantId":"m","amount":1,"currency":"XYZ","paymentMethodToken":"t"}'   # 400, names the field
 ```
+
+To make the processor misbehave on purpose - slow, failing, duplicating, down - see
+[Failure handling](#failure-handling): one curl per failure mode.
 
 Every error is an RFC 7807 `application/problem+json` body. The full API is at
 <http://localhost:8080/swagger-ui.html>. On Windows PowerShell, `curl` is an alias for
@@ -164,6 +174,9 @@ move is to retry, sometimes while the first attempt is still running. So the cli
    dead, so recovery happens *after* it rolls back: read the stored row in a fresh transaction.
 4. Same fingerprint → replay the stored response with `200`. Different fingerprint → `422`.
 
+The request that created the payment then authorises it, and replaces the stored response with what
+it actually returns, so a later replay matches. A replay never calls the processor.
+
 The full reasoning, the alternatives rejected, and what this makes hard are in
 [ADR-004](docs/adr/0004-idempotency-keys.md).
 
@@ -171,7 +184,9 @@ The full reasoning, the alternatives rejected, and what this makes hard are in
 |---|---|---|
 | first time seen | `201 Created`, `Location` | one payment, one key row, one transaction |
 | same request again | `200 OK`, the **original** body, byte-identical, `Idempotent-Replayed: true` | nothing |
-| same request, first still in flight | waits on the unique index, then `200` (first committed) or `201` (first rolled back) | at most one payment either way |
+| same request, first still creating | waits on the unique index, then `200` (first committed) or `201` (first rolled back) | at most one payment either way |
+| same request, first still calling the processor | `200` with the `CREATED` snapshot, because the final answer doesn't exist yet | nothing |
+| same request, first got a `504` | the same `504`, `Idempotent-Replayed: true` | nothing |
 | **different** request | `422`, naming the original payment and the differing fields | nothing |
 
 **How "same request" is decided.** The request is fingerprinted as the SHA-256 of its *parsed* body,
@@ -209,7 +224,7 @@ Each property is tested against a real PostgreSQL (Testcontainers), with real th
 | 1. No second payment, under concurrency | `PaymentControllerIT` (20 threads) | 20 identical requests released together by a latch: **one `201`, nineteen `200`s, 20 identical ids, one row**. 20 is twice the connection pool, on purpose. |
 | 1. …including mid-flight | `PaymentApplicationServiceIT` | The first transaction is held open, and `pg_stat_activity` confirms the retry is *waiting on the lock*. Commit → the retry replays. Roll back → the retry creates. One row either way. |
 | 1. Key and payment are atomic | `PaymentApplicationServiceIT` | The key row is flushed, then the payment insert fails: afterwards, **no key row and no payment**. |
-| 2. The original answer | `PaymentControllerIT` | The second response *string-equals* the first. After the payment is authorised, a replay still says `CREATED`. |
+| 2. The original answer | `PaymentControllerIT` | The second response *string-equals* the first. After the payment is captured, a replay still says `AUTHORIZED`, and the processor isn't called again. |
 | 3. Different body → 422 | `PaymentControllerIT` | 12500 then 999 with one key → `422`, still exactly one payment, at 12500. Neither amount appears in the error. |
 | "Same request" is semantic | `PaymentControllerIT`, `CanonicalRequestHashTest` | A reordered, re-spaced body replays (`200`, not `422`). The hash is pinned to a SHA-256 vector computed independently. |
 
@@ -228,9 +243,11 @@ sequenceDiagram
     C->>P: POST /payments (Idempotency-Key: order-827361)
     P->>DB: BEGIN · INSERT idempotency_keys · INSERT payment (CREATED) · COMMIT
     Note over P,DB: The unique constraint on (merchant_id, idempotency_key)<br/>is what makes a retry safe. A duplicate key is not an<br/>error path - it is the replay path.
+    P->>DB: BEGIN · payment -> PROCESSING · INSERT payment_attempts (PENDING) · COMMIT
+    Note over P,DB: Committed before the call, so a crash leaves evidence.<br/>No transaction or connection is held during the call.
     P->>X: POST /authorize (timeout 2s, bounded retry, circuit breaker)
     X-->>P: 200 approved
-    P->>DB: BEGIN · payment -> AUTHORIZED · INSERT outbox_events · COMMIT
+    P->>DB: BEGIN · attempt -> SUCCESS · payment -> AUTHORIZED · INSERT outbox_events · COMMIT
     Note over P,DB: One transaction. Either both facts are true<br/>or neither is.
     P-->>C: 201 Created
     loop polling publisher
@@ -245,14 +262,72 @@ sequenceDiagram
 
 ## Failure handling
 
+Every processor failure this service handles can be reproduced on the running stack with one curl:
+flip the simulator's mode, then create a payment. Why each is handled the way it is - and which
+resilience patterns were deliberately *not* used - is in
+[ADR-008](docs/adr/0008-processor-resilience.md).
+
+### Reproduce it
+
+Two helpers, in bash (Git Bash on Windows): `pay` creates a payment and prints the status and time;
+`attempts` shows the latest rows of `payment_attempts`.
+
+```bash
+PAY='{"merchantId":"demo","amount":12500,"currency":"INR","paymentMethodToken":"tok_test_123"}'
+pay() { curl -s -w '  -> HTTP %{http_code} in %{time_total}s\n' -X POST http://localhost:8080/payments -H 'Content-Type: application/json' -d "$PAY"; }
+attempts() { docker exec dpp-postgres psql -U payments -d payments -c "SELECT outcome, error_code, call_count, latency_ms FROM payment_attempts ORDER BY created_at DESC LIMIT 3"; }
+fresh() { curl -s -X PUT 'http://localhost:8081/control/mode?mode=NORMAL' >/dev/null; sleep 11; for i in $(seq 20); do pay >/dev/null; done; }
+```
+
+Then, for each mode, run the curl, then `pay`, then `attempts`. **Run `fresh` between rows.** The
+circuit breaker judges the last 20 calls, so failures from one row count towards the next: run the
+table straight through and the breaker opens partway, exactly as designed. `fresh` resets the
+simulator and waits out an open breaker, then fills the window with 20 successes (about 15s).
+
+| Failure | One curl | What you'll see |
+|---|---|---|
+| Processor refuses (rate limit) | `curl -X PUT 'http://localhost:8081/control/mode?mode=HTTP_429'` | `201`, `"status":"FAILED"`; attempt `FAILURE`, `HTTP_429`. Refused, so no money moved |
+| Processor errors | `curl -X PUT 'http://localhost:8081/control/mode?mode=HTTP_500'` | `504`, names the payment; attempt `UNKNOWN`, `HTTP_500`, not retried. It may have failed before the charge or after it |
+| Processor never answers | `curl -X PUT 'http://localhost:8081/control/mode?mode=TIMEOUT'` | `504` after ~2s; attempt `TIMEOUT`, `READ_TIMEOUT`; payment stays `PROCESSING`, never `FAILED` |
+| Processor too slow | `curl -X PUT 'http://localhost:8081/control/mode?mode=SLOW'` | The same `504` after ~2s: the same outcome, a different cause. The processor will still approve, 10s later |
+| Background noise | `curl -X PUT 'http://localhost:8081/control/mode?mode=INTERMITTENT&failureRate=0.05'` | Run `for i in $(seq 40); do pay; done`: about 1 in 20 is a `504`, and the breaker stays `CLOSED` |
+| Answer delivered twice | `curl -X PUT 'http://localhost:8081/control/mode?mode=DUPLICATE_RESPONSE'` | `201`, `AUTHORIZED`; **one** attempt row with `call_count` 2: the answer was cut off, the retry got it again |
+| Processor fails, keeps failing | `curl -X PUT 'http://localhost:8081/control/mode?mode=HTTP_500'` | Run `for i in $(seq 10); do pay; done`, then `pay`: the 11th is a `503` in milliseconds with `Retry-After: 10`, and nothing was created. The breaker is `OPEN` |
+| Processor recovers | `curl -X PUT 'http://localhost:8081/control/mode?mode=NORMAL'` | After 10s the breaker goes `HALF_OPEN` on its own; three payments later, `CLOSED` |
+| An outage that ends by itself | `curl -X PUT 'http://localhost:8081/control/mode?mode=OUTAGE'` | Run `for i in $(seq 45); do pay; sleep 1; done`: `504`s, then `503`s once the breaker opens, then `201`s. 30s of `503` from the processor, then it recovers with no second curl |
+| Processor slow, flooded | `curl -X PUT 'http://localhost:8081/control/mode?mode=SLOW&latency=1500ms'` | Flood it (below): 20 at a time get `201` (about 100 across the flood), the rest `503` at once. The bulkhead holds 20 in flight, so reads stay fast |
+| Processor down | `docker compose stop processor-simulator` | `201`, `FAILED` in up to ~2s; one attempt with `call_count` 3, `CONNECT_FAILED`. After about 4 payments, `503`. Bring it back with `docker compose start processor-simulator` |
+
+Back to normal at any point with `curl -X PUT 'http://localhost:8081/control/mode?mode=NORMAL'`. If the
+breaker is open, give it 10s. Watch it with `curl http://localhost:8080/actuator/circuitbreakers` and
+`curl http://localhost:8080/actuator/circuitbreakerevents/processor`.
+
+The flood for the bulkhead row: 300 payments at once, counted by status.
+
+```bash
+seq 300 | xargs -P 300 -I{} curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/payments -H 'Content-Type: application/json' -d "$PAY" | sort | uniq -c
+```
+
+The `504` says the payment may or may not have been charged, names it, and says not to create a new
+one. The `503` means the breaker is open or too many payments are already waiting on the processor:
+nothing was created or charged, so retry after `Retry-After` with the same key. A decline can't be
+forced, but `NORMAL` declines about 5% on purpose: a `201` with `"status":"FAILED"`.
+
+### Every failure, and where it's proven
+
 | Failure | What happens                                                                     | Where it is demonstrated |
 |---|----------------------------------------------------------------------------------|---|
 | Client retries the same request | Same payment returned, no second charge                                          | `PaymentControllerIT`, `PaymentApplicationServiceIT` |
 | Same key, different payload | `422`, never a silent replay of a different amount                               | `PaymentControllerIT.sameIdempotencyKeyWithDifferentPayloadIsRejected` |
 | Two concurrent captures | One wins on the optimistic-lock version, the other gets `409`, never retried     | `PaymentControllerIT`, `PaymentApplicationServiceIT` (20 runs each) |
-| Processor slow | Client-side timeout bounds the wait; bulkhead stops it consuming every thread    | *Phase 3* |
-| Processor returning 500 | Bounded retry with jitter, then the circuit breaker opens and requests fail fast | *Phase 3* |
-| Processor times out | Attempt recorded as `UNKNOWN`; reconciliation, never a blind retry               | *Phase 3* |
+| Processor declines | `FAILED`, decline code recorded, a `201`. A return value, not an exception, so a breaker can't count it | `PaymentControllerIT`, `ProcessorClientTest` |
+| Processor slow | A timeout bounds each wait; the bulkhead caps payments in flight at 20, so reads keep their threads (p95 61 ms under a flood, vs 1,119 ms without it) | `ProcessorClientTest`, `BulkheadIT`, [ADR-008](docs/adr/0008-processor-resilience.md) |
+| Processor answers twice | One authorisation, one attempt row: a retry with the same request id counts the call, and the database refuses a second row | `PaymentControllerIT.aDuplicatedAnswerIsOneAttemptWithOneAuthorisation` |
+| Processor returning 500 | `504`, attempt `UNKNOWN`, payment stays `PROCESSING`, not retried; counted by the circuit breaker | `ProcessorClientTest`, `PaymentAuthorizerTest` |
+| Processor times out | `504` in ~2s, attempt `TIMEOUT`, payment stays `PROCESSING`, never `FAILED` (built); reconciliation (*Phase 3*) | `PaymentControllerIT.processorTimeoutIsABounded504AndTheAttemptIsTimeoutNotFailure` |
+| Connection refused or broken | Up to 3 attempts inside a total deadline, backoff with jitter, same request id every time, one attempt row with the calls counted | `PaymentAuthorizerTest`, `PaymentControllerIT` |
+| Processor down, or mostly failing | After 10 failed calls (50% of a 20-call window) the breaker opens: `503` in milliseconds, nothing created. It probes itself after 10s | `CircuitBreakerIT.theFullLifecycle`, [ADR-008](docs/adr/0008-processor-resilience.md) |
+| A realistic 5% error rate | The breaker stays closed: zero trips in 100,000 simulated calls, and none in 200 real payments | `CircuitBreakerIT.productionThresholdsIgnore5PercentNoiseButOpenOnARealOutage` |
 | Kafka down | Payments still succeed; the outbox drains when the broker returns                | *Phase 4* |
 | Duplicate Kafka delivery | `processed_events` makes the second delivery a no-op                             | *Phase 4* |
 | Redis down | Correct, just slower, the cache is never the source of truth                     | *Phase 5* |
@@ -274,8 +349,8 @@ significant amount of availability for a guarantee this domain does not need.
 
 | Suite | What it covers | Runs on |
 |---|---|---|
-| Unit (`*Test`) | Domain rules, the canonical hash, the HTTP contract with the service mocked | `mvn test`, no Docker |
-| Integration (`*IT`) | Real PostgreSQL via Testcontainers: transactions, constraints, concurrency | `mvn verify`, needs Docker |
+| Unit (`*Test`) | Domain rules, the canonical hash, the HTTP contract with the service mocked, and `ProcessorClient` over real HTTP to an in-process fake | `mvn test`, no Docker |
+| Integration (`*IT`) | Real PostgreSQL via Testcontainers: transactions, constraints, concurrency, and the full authorisation flow | `mvn verify`, needs Docker |
 | Mutation (PIT) | Whether the unit tests would *notice* a change to `domain` and `service` | CI job, gated |
 
 **Concurrency is tested with real threads against a real database,** never with `Thread.sleep`:
@@ -288,19 +363,31 @@ plus a deterministic twin that forces the stale read.
 | Date | Killed | Score | Test strength | Line coverage |
 |---|---|---|---|---|
 | 2026-10-19, first run | 77 / 121 | 64% | 87% | 75% |
-| 2026-10-19, after killing the weakest survivors | 91 / 121 | **75%** | 99% | 76% |
+| 2026-10-19, after killing the weakest survivors | 91 / 121 | 75% | 99% | 76% |
+| 2026-10-30, processor integration | 130 / 156 | 83% | 98% | 87% |
+| 2026-11-02, bounded retries | 158 / 187 | 84% | 96% | 89% |
+| 2026-11-05, circuit breaker | 172 / 202 | 85% | 96% | 90% |
+| 2026-11-13, bulkhead, one attempt per request id | 187 / 217 | **86%** | 96% | 90% |
 
 - **Line coverage moved one point, and mutation score moved eleven.** The `Payment` entity's lines
   were already *executed* by other tests, but nothing asserted on them. Deleting the state-machine
   guard from `Payment.transitionTo` survived. So did removing the positive-amount check, and a
   `<` → `<=` boundary in `Money` formatting that would print zero as `-0.00`. Each now has a test.
-- **The CI gate is 75**, just under the measured 75.2%. Disabling one test drops the score to 74
-  and fails the build. That was checked before trusting the gate. The gate goes up as the score
-  does.
-- **What's left:** one *equivalent* mutant (`target == null` in `PaymentStatus.canTransitionTo`,
-  which `EnumSet.contains(null)` already makes false). The other 29 unkilled mutants are in code
-  only the integration tests reach (`PaymentApplicationService`, `IdempotencyKey`). PIT doesn't run
-  Testcontainers, so that code is well tested but not mutation-tested.
+- **The gate caught new code.** The processor integration first measured 72%, which failed the build.
+  The new authorisation logic only had integration tests, so it got unit tests rather than a lower
+  gate.
+- **The CI gate is 86**, the measured whole percentage. PIT rounds before comparing, so a lost kill
+  can pass if the score still rounds to the gate. Disabling `PaymentAuthorizerTest` fails the build.
+  That was checked before trusting the gate. The gate goes up as the score does.
+- **What's left:** seven survivors that change no behaviour: `target == null` in
+  `PaymentStatus.canTransitionTo`, which `EnumSet.contains(null)` already makes false; five in
+  `PaymentAuthorizer` (a log condition, Resilience4j's metrics-only `onComplete`, a nanosecond
+  boundary on the deadline, and a null check whose mutant ends the same way); and one in
+  `IdempotentPaymentCreator` that looks up a null key, finds nothing, and gives the same `503`. The
+  other 23 unkilled mutants are in code only the integration tests reach,
+  mostly `PaymentApplicationService` and `IdempotencyKey`. PIT doesn't run Testcontainers, so that code
+  is well tested but not mutation-tested. `ProcessorClient` is outside PIT's scope too: it's tested,
+  but the score says nothing about it.
 
 ## Roadmap and honest status
 
@@ -315,6 +402,25 @@ plus a deterministic twin that forces the stale read.
   different body, proven under concurrency against a real PostgreSQL. See [Idempotency](#idempotency).
 - Optimistic locking on the payment row: two simultaneous captures give exactly one capture, and
   the loser gets a `409` that tells it to fetch the payment before retrying.
+- Real authorisation over HTTP: `POST /payments` moves `CREATED → PROCESSING → AUTHORIZED | FAILED`,
+  with explicit connect and read timeouts and no transaction held during the call. A `payment_attempts`
+  row is written before the call and completed after it: one row per processor request id, so retries
+  and a duplicated answer count calls on it rather than adding rows.
+- Bounded retries: up to 3 attempts for connection failures, with exponential backoff and jitter, the
+  same request id on every call, and a total deadline. A read timeout uses up that deadline, so the
+  client gets a `504` in ~2s rather than ~6.6s. Declines, `4xx` and `5xx` are never retried.
+- A circuit breaker on every processor call, with thresholds chosen against a 5% background error
+  rate ([ADR-008](docs/adr/0008-processor-resilience.md)). An open breaker answers `503` with
+  `Retry-After` before anything is written, and probes the processor on its own. Its state is at
+  `/actuator/circuitbreakers`.
+- A bulkhead: at most 20 payments creating and authorising at once. The rest get `503` immediately,
+  before anything is written, so a slow processor can't take every request thread. Measured: reads
+  under a 300-client flood stay as fast as with no flood. Why a bulkhead still matters with virtual
+  threads is in [ADR-008](docs/adr/0008-processor-resilience.md).
+- `processor-simulator`, switchable at runtime with one curl: `/authorize` handles all eight modes,
+  `NORMAL`, `SLOW` (with a settable latency), `TIMEOUT`, `HTTP_500`, `HTTP_429`, `INTERMITTENT` (with a
+  settable failure rate), `DUPLICATE_RESPONSE` and `OUTAGE`, and answers a repeated request id with its
+  original answer.
 - Uniform RFC 7807 errors; OpenAPI/Swagger UI generated from the controllers.
 - CI on every push: unit tests and Testcontainers integration tests against a real PostgreSQL,
   plus a PIT mutation-score gate set from a measured score. See [Testing](#testing).
@@ -325,17 +431,28 @@ plus a deterministic twin that forces the stale read.
 - **The `Idempotency-Key` is still optional.** A `POST` without one creates a payment with no
   replay protection, so a client that retries it gets a second payment. Making the header required
   is next. Expired keys are not swept yet either, so they keep replaying past 24h.
-- **No processor.** Nothing moves a payment from `CREATED` to `AUTHORIZED` in the running stack,
-  so capture and refund can only be reached in tests, through a temporary admin endpoint that is
-  disabled by default and is deleted in Phase 3. `processor-simulator` is scaffolded; its
-  endpoints return `501`.
+- **A brief `429` isn't retried**, so it fails the payment outright.
+- **No reconciliation.** A payment left in `PROCESSING` by a timeout or a `5xx` stays there, and so
+  does one whose process died mid-call. A payment can also stay `CREATED` if the process dies right
+  after creating it. Nothing finds these yet, and a retry with the same key only replays.
+- **The first payments into a dead processor end `FAILED`.** Until the breaker has seen 10 failed calls
+  (about 4 payments), each gets a `201` with `status: FAILED`, and its key replays that. Only after
+  that is it a clean `503`. The same happens to a request that slips past the breaker check just as it
+  opens.
+- **Capture and refund don't call the processor.** They only change state here. `processor-simulator`
+  still returns `501` for `/capture`, `/refund` and `/control/reset`.
+- **An attempt row keeps only its last call's outcome.** Since retries share a row, the outcomes of
+  earlier failed calls are in the logs, not the table.
 - **No Kafka, outbox or ledger.** `GET /payments/{id}/ledger` returns `501`. `ledger-service` is a
   placeholder with no runnable logic.
 - **Concurrency is proven for capture only.** Two simultaneous captures give exactly one `200`
   and one `409`, and the test fails if `@Version` is removed. Refund takes the same path but has
   no race test of its own yet.
-- No auth, no Redis, no metrics dashboards, no Kubernetes, no load-test numbers. Nothing on this
-  page is a performance claim.
+- **No auth.** Anyone who can reach port 8080 can call the API and read the actuator. The actuator is
+  read-only as a stopgap: exposing `circuitbreakers` had also exposed a write operation that let
+  anyone force the breaker open or switch it off, so every non-`GET` under `/actuator` now gets `405`.
+- No Redis, no metrics dashboards, no Kubernetes, no load-test numbers. Nothing on this page is a
+  performance claim beyond the measured runs in ADR-008, which were on one laptop.
 
 **Deliberately out of scope - known limitations, not oversights**
 
@@ -350,7 +467,7 @@ plus a deterministic twin that forces the stale read.
 |---|---|---|
 | 1 | Payment lifecycle, state machine, PostgreSQL, OpenAPI, Docker | Done |
 | 2 | Idempotency, unique constraints, optimistic locking, concurrency tests | **In progress**: idempotent create and concurrent capture done; required key and expiry sweep next |
-| 3 | Processor simulator, timeouts, retry, circuit breaker, bulkhead (`v0.1`) | Scaffolded (endpoints return `501`) |
+| 3 | Processor simulator, timeouts, retry, circuit breaker, bulkhead (`v0.1`) | **In progress**: simulator, authorisation, timeouts, bounded retry, circuit breaker and bulkhead done; ADR-008 in full and the `v0.1` tag next |
 | 4 | Kafka, transactional outbox, ledger service, idempotent consumers (`v0.2`) | Scaffolded (no runnable logic) |
 | 5 | Redis cache and idempotency acceleration, measured | Not started |
 | 6 | OpenTelemetry, Prometheus, Grafana, structured logging | Not started |

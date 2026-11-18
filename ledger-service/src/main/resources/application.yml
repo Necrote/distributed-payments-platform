@@ -3,7 +3,7 @@ spring:
   application:
     name: ledger-service
   datasource:
-    url: ${LEDGER_DB_URL:jdbc:postgresql://localhost:5432/payments}
+    url: ${LEDGER_DB_URL:jdbc:postgresql://localhost:15432/payments}
     username: ${LEDGER_DB_USER:payments}
     password: ${LEDGER_DB_PASSWORD:payments}
   jpa:

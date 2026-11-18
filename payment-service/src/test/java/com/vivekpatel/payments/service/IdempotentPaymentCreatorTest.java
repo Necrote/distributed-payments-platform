@@ -14,6 +14,10 @@ import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
 import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.domain.PaymentStatus;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Duration;
@@ -36,17 +40,154 @@ class IdempotentPaymentCreatorTest {
     private static final String KEY = "key-1";
 
     private final PaymentApplicationService service = mock(PaymentApplicationService.class);
+    private final PaymentAuthorizer authorizer = mock(PaymentAuthorizer.class);
     private final ObjectMapper mapper = JsonMapper.builder().findAndAddModules().build();
-    private final IdempotentPaymentCreator creator = new IdempotentPaymentCreator(service, mapper);
+    // A bulkhead of one, so a test can fill it by holding the single permit.
+    private final Bulkhead bulkhead = Bulkhead.of("processor",
+            BulkheadConfig.custom().maxConcurrentCalls(1).maxWaitDuration(Duration.ZERO).build());
+    private final BulkheadRegistry bulkheads = BulkheadRegistry.ofDefaults();
+    private final IdempotentPaymentCreator creator;
+
+    IdempotentPaymentCreatorTest() {
+        bulkheads.addConfiguration("one", bulkhead.getBulkheadConfig());
+        bulkheads.bulkhead("processor", "one");
+        creator = new IdempotentPaymentCreator(service, authorizer, bulkheads, mapper);
+    }
+
+    private Bulkhead bulkhead() {
+        return bulkheads.bulkhead("processor");
+    }
 
     @Test
-    void firstCallIsCreated() {
-        Payment payment = payment();
-        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenReturn(payment);
+    void aFullBulkheadRefusesANewPaymentAndCreatesNothing() {
+        assertThat(bulkhead().tryAcquirePermission()).isTrue();
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(TooManyPaymentsInFlightException.class,
+                        e -> assertThat(e.getRetryAfter()).isEqualTo(Duration.ofSeconds(1)));
+        verify(service, never()).create(any(), any(), any(), any(), any());
+        verify(authorizer, never()).authorize(any(), any());
+    }
+
+    @Test
+    void aFullBulkheadStillReplaysAKeyThatWasAlreadyUsed() throws Exception {
+        assertThat(bulkhead().tryAcquirePermission()).isTrue();
+        Payment original = payment();
+        IdempotencyKey stored = storedKey(
+                PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", "ref"), original);
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
 
         assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
-                .isEqualTo(new CreatePaymentResult.Created(payment));
+                .isEqualTo(new CreatePaymentResult.Replayed(PaymentResponse.from(original)));
+        // It never took a permit, so it must not give one back either.
+        assertThat(bulkhead().getMetrics().getAvailableConcurrentCalls()).isZero();
+    }
+
+    @Test
+    void thePermitIsReturnedWhenTheRequestFinishes() {
+        Payment created = payment();
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenReturn(created);
+        when(authorizer.authorize(created.getId(), KEY)).thenReturn(created);
+
+        creator.create("m-1", AMOUNT, "tok", "ref", KEY);
+
+        assertThat(bulkhead().getMetrics().getAvailableConcurrentCalls()).isOne();
+    }
+
+    @Test
+    void thePermitIsReturnedEvenWhenTheRequestFails() {
+        // Otherwise every failure would leak a permit, and the bulkhead would close for good.
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(new IllegalStateException("db down"));
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOf(IllegalStateException.class);
+
+        assertThat(bulkhead().getMetrics().getAvailableConcurrentCalls()).isOne();
+    }
+
+    @Test
+    void firstCallCreatesThenAuthorizesAndReturnsTheAuthorizedPayment() {
+        Payment created = payment();
+        Payment authorized = payment();
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenReturn(created);
+        when(authorizer.authorize(created.getId(), KEY)).thenReturn(authorized);
+
+        assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isEqualTo(new CreatePaymentResult.Created(authorized));
         verify(service, never()).findIdempotencyKey(any(), any());
+    }
+
+    @Test
+    void anOpenBreakerFailsFastAndCreatesNothing() {
+        when(authorizer.processorIsRejectingCalls()).thenReturn(true);
+        when(authorizer.processorRetryAfter()).thenReturn(Duration.ofSeconds(10));
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(ProcessorUnavailableException.class,
+                        e -> assertThat(e.getRetryAfter()).isEqualTo(Duration.ofSeconds(10)));
+        verify(service, never()).create(any(), any(), any(), any(), any());
+        verify(authorizer, never()).authorize(any(), any());
+    }
+
+    @Test
+    void anOpenBreakerFailsFastWithoutAKeyToo() {
+        when(authorizer.processorIsRejectingCalls()).thenReturn(true);
+        when(authorizer.processorRetryAfter()).thenReturn(Duration.ofSeconds(10));
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", null))
+                .isInstanceOf(ProcessorUnavailableException.class);
+        verify(service, never()).create(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void anOpenBreakerStillReplaysAKeyThatWasAlreadyUsed() throws Exception {
+        // A replay needs no processor, so refusing it would turn a success into an error.
+        Payment original = payment();
+        IdempotencyKey stored = storedKey(
+                PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", "ref"), original);
+        when(authorizer.processorIsRejectingCalls()).thenReturn(true);
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
+
+        assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isEqualTo(new CreatePaymentResult.Replayed(PaymentResponse.from(original)));
+    }
+
+    @Test
+    void aPaymentLeftProcessingIsAnUnknownOutcomeNotACreated() {
+        Payment created = payment();
+        Payment processing = payment();
+        processing.transitionTo(PaymentStatus.PROCESSING, FIXED);
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenReturn(created);
+        when(authorizer.authorize(created.getId(), KEY)).thenReturn(processing);
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(PaymentOutcomeUnknownException.class, e -> {
+                    assertThat(e.getPaymentId()).isEqualTo(processing.getId());
+                    assertThat(e.isReplayed()).isFalse();
+                });
+    }
+
+    @Test
+    void replayingAnUnknownOutcomeRepeatsItRatherThanReportingSuccess() throws Exception {
+        Payment original = payment();
+        original.transitionTo(PaymentStatus.PROCESSING, FIXED);
+        IdempotencyKey stored = IdempotencyKey.claim(
+                "m-1", KEY, PaymentApplicationService.requestHash("m-1", AMOUNT, "tok", "ref"),
+                Duration.ofHours(24), FIXED);
+        stored.recordResponse(original.getId(), 504, mapper.writeValueAsString(PaymentResponse.from(original)));
+        when(service.create("m-1", AMOUNT, "tok", "ref", KEY)).thenThrow(duplicate(IdempotentPaymentCreator.KEY_CONSTRAINT));
+        when(service.findIdempotencyKey("m-1", KEY)).thenReturn(Optional.of(stored));
+
+        assertThatThrownBy(() -> creator.create("m-1", AMOUNT, "tok", "ref", KEY))
+                .isInstanceOfSatisfying(PaymentOutcomeUnknownException.class, e -> {
+                    assertThat(e.getPaymentId()).isEqualTo(original.getId());
+                    assertThat(e.isReplayed()).isTrue();
+                });
+        verify(authorizer, never()).authorize(any(), any());
     }
 
     @Test
@@ -59,6 +200,8 @@ class IdempotentPaymentCreatorTest {
 
         assertThat(creator.create("m-1", AMOUNT, "tok", "ref", KEY))
                 .isEqualTo(new CreatePaymentResult.Replayed(PaymentResponse.from(original)));
+        // A retry must never become a second call to the processor.
+        verify(authorizer, never()).authorize(any(), any());
     }
 
     @Test
@@ -73,6 +216,7 @@ class IdempotentPaymentCreatorTest {
                     assertThat(e.getOriginalPaymentId()).isEqualTo(original.getId());
                     assertThat(e.getDifferingFields()).containsExactly("amount");
                 });
+        verify(authorizer, never()).authorize(any(), any());
     }
 
     @Test

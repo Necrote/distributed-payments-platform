@@ -58,20 +58,31 @@ public enum FailureMode {
     INTERMITTENT("Fails a configured fraction of calls at random"),
 
     /**
-     * Processes the request but returns the response twice (or replays the previous response for a
-     * repeated request id). Proves the payment service is idempotent at the PROCESSOR boundary too,
-     * not only at the client boundary - a duplicate authorisation response must not create a second
-     * attempt record or a second ledger movement.
+     * Delivers one authorisation's answer twice. The first time a request id arrives, the processor
+     * authorises it and then the connection breaks halfway through the answer, so the caller cannot
+     * read it. When the caller retries with the same request id, it gets that same answer again,
+     * whole. Proves the payment service is idempotent at the PROCESSOR boundary too, not only at the
+     * client boundary - a duplicate authorisation response must not create a second attempt record or
+     * a second ledger movement.
+     *
+     * <p>Over plain HTTP one request can only get one response, so "twice" means a cut-off delivery
+     * and then a repeat. Every other mode also replays a repeated request id; this is the mode that
+     * forces the repeat.
      */
-    DUPLICATE_RESPONSE("Sends the same response twice - the caller must deduplicate"),
+    DUPLICATE_RESPONSE("Answers twice: once cut off, then whole on a retry - the caller must deduplicate"),
 
     /**
-     * Refuses every connection for a configured window, then recovers. This is the full circuit
-     * breaker lifecycle in one scenario: CLOSED, OPEN once the failure rate crosses the threshold,
-     * HALF_OPEN after the wait duration, and CLOSED again when the probe calls succeed. Watch the
-     * state transitions in {@code /actuator/circuitbreakers} while it runs.
+     * Answers every call with 503 for a configured window ({@code outage-duration}), then recovers
+     * by itself and goes back to NORMAL. This is the full circuit breaker lifecycle in one scenario:
+     * CLOSED, OPEN once the failure rate crosses the threshold, HALF_OPEN after the wait duration,
+     * and CLOSED again when the probe calls succeed - with no second curl. Watch the state transitions
+     * in {@code /actuator/circuitbreakers} while it runs.
+     *
+     * <p>A 503 rather than refused connections: the simulator runs on the servlet stack, which can't
+     * refuse a connection it has already accepted. Both open the breaker; only refused connections
+     * would also be retried, so this is the less flattering case for the caller.
      */
-    OUTAGE("Refuses connections for a window, then recovers");
+    OUTAGE("503 for a window, then recovers on its own");
 
     private final String description;
 

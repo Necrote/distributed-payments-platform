@@ -1,7 +1,7 @@
 # ADR-004: Idempotency keys enforced by a database unique constraint
 
 - **Status:** Accepted
-- **Date:** 2026-10-13 · **Revised:** 2026-10-22 (what the week's tests taught; see [Revision notes](#revision-notes))
+- **Date:** 2026-10-13 · **Revised:** 2026-10-22 (what the week's tests taught), 2026-10-31 (the processor call; see [Revision notes](#revision-notes))
 - **Scope:** `payment-service`, `POST /payments`
 - **Related:** [ADR-006](0006-payment-state-machine.md), the payment state machine. Idempotency
   stops a *second create*; ADR-006 stops a *second transition*.
@@ -29,6 +29,12 @@ Three things have to be true at once:
   private to the hasher, not Spring's shared `ObjectMapper`.
 - The key row is inserted **in the same transaction as the payment**, and flushed first. The response
   status and body are written to that row before commit.
+- **The stored response is rewritten once, when authorisation finishes.** The processor call runs
+  after the create transaction, so the first response isn't known until then. The transaction that
+  records the attempt's outcome also stores the response the request is about to return. After that
+  the row never changes, and a replay never calls the processor. If the outcome is unknown, the
+  stored status is `504` and a replay repeats that `504` rather than a `200`, which would read as
+  success.
 - A duplicate-key violation on that constraint is the replay path, not an error path. It is caught
   **outside** the failed transaction (`IdempotentPaymentCreator`, `Propagation.NEVER`), and the stored
   row is read in a new read-only transaction. Then:
@@ -128,11 +134,20 @@ Three things have to be true at once:
   connection for as long as the first transaction runs. That's cheap today, because nothing slow
   happens inside the transaction. The 20-thread test runs at **twice the pool size (10)** on
   purpose: up to ten requests hold connections while they wait, and the rest queue for one. It
-  passes only because the winner commits in milliseconds. When the processor call arrives
-  (Phase 3), it **must not** be inside this transaction, or every concurrent retry waits for the
-  processor while holding a connection. That test will be the first thing to time out if it is.
+  passes only because the winner commits in milliseconds. The processor call is **not** inside this
+  transaction, or every concurrent retry would wait for the processor while holding a connection.
+  `PaymentAuthorizer` is `Propagation.NEVER`, so wrapping the call in a transaction throws
+  immediately. The 20-thread test can't show a slow processor, though, because its fake answers at
+  once.
 - **Replay shows the past, not the present.** A client that wants the payment's current status has to
   `GET /payments/{id}`. That's deliberate, and it has to be documented for API users.
+- **A retry during the processor call gets a snapshot, not the answer.** The key row commits before
+  the call, so a retry in that window no longer waits. It replays the `CREATED` response, which never
+  was the first response. It's harmless for the money, because no second charge happens, but it breaks
+  property 2 for that window. A "still in progress" `409` would be more honest, and isn't built.
+- **A crash can freeze the replay.** If the process dies after the create commits, or the outcome
+  can't be written, the row keeps the `CREATED` response, and every retry replays it without resuming
+  the authorisation. Finding these payments is reconciliation's job, and that isn't built.
 - **Unbounded growth is now our problem.** This is the hottest write table in the service. The
   expiry sweep isn't built yet. Until it is, rows past `expires_at` stay, and they still replay.
 - **Recognising "our" violation depends on Hibernate's exception shape.** The constraint name comes
@@ -149,6 +164,8 @@ Three things have to be true at once:
 | Key + payment in one transaction | Built, tested (rollback IT) |
 | Replay (200, original body, byte-identical) | Built, tested (HTTP IT, in-flight ITs, 8-thread and 20-thread ITs) |
 | Different body → 422 with differing fields | Built, tested (HTTP IT, unit tests) |
+| Stored response updated after authorisation; replay never calls the processor | Built, tested (HTTP ITs, unit tests) |
+| "In progress" response for a retry during the processor call | Not built: it replays the `CREATED` snapshot |
 | `Idempotency-Key` required on `POST /payments` | Not yet: requests without a key still create a payment |
 | Expiry sweep | Not built |
 
@@ -170,3 +187,12 @@ direction. These were added:
 The transaction-boundary trap was in the first version. It's kept as written because it was
 observed, not predicted: all three failures were reproduced against PostgreSQL before this ADR
 described them.
+
+**2026-10-31.** Revised when the processor call arrived. The key and the payment still commit
+together, but the first response now depends on a call made after that commit. So the stored response
+is rewritten when authorisation finishes, and two new gaps are recorded under "What this makes hard":
+the snapshot a retry gets during the call, and the replay a crash can freeze.
+
+**2026-11-02.** An unknown outcome now answers `504` instead of `201`, so the stored status records
+it and a replay repeats the `504`, with `Idempotent-Replayed: true`. The replay can stay `504` after
+the payment has moved on, for the reason in "Replay shows the past, not the present".

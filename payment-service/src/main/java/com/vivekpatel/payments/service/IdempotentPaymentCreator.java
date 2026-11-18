@@ -5,11 +5,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vivekpatel.payments.api.dto.PaymentResponse;
 import com.vivekpatel.payments.domain.IdempotencyKey;
 import com.vivekpatel.payments.domain.Money;
+import com.vivekpatel.payments.domain.Payment;
+import com.vivekpatel.payments.domain.PaymentStatus;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import org.hibernate.exception.ConstraintViolationException;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -42,16 +48,37 @@ public class IdempotentPaymentCreator {
 
     static final String KEY_CONSTRAINT = "uq_idempotency_key_per_merchant";
 
+    /** A full bulkhead frees up in about one processor round trip, so a second is honest. */
+    static final Duration RETRY_WHEN_FULL = Duration.ofSeconds(1);
+
     private final PaymentApplicationService payments;
+    private final PaymentAuthorizer authorizer;
+    private final Bulkhead bulkhead;
     private final ObjectMapper objectMapper;
 
-    public IdempotentPaymentCreator(PaymentApplicationService payments, ObjectMapper objectMapper) {
+    public IdempotentPaymentCreator(
+            PaymentApplicationService payments,
+            PaymentAuthorizer authorizer,
+            BulkheadRegistry bulkheads,
+            ObjectMapper objectMapper) {
         this.payments = payments;
+        this.authorizer = authorizer;
+        this.bulkhead = bulkheads.bulkhead("processor");
         this.objectMapper = objectMapper;
     }
 
     /**
+     * Creates the payment and authorises it with the processor. A replay does neither: the
+     * request that created the payment also authorised it, and a retry must never become a second
+     * call to the processor.
+     *
      * @throws IdempotencyKeyReusedException if the key was used before with a different request.
+     * @throws PaymentOutcomeUnknownException if the processor gave no usable answer, on this call
+     *     or on the earlier one being replayed. The payment exists and stays {@code PROCESSING}.
+     * @throws ProcessorUnavailableException if the circuit breaker is open and this would be a new
+     *     payment. Nothing is created, so a retry with the same key works once it closes.
+     * @throws TooManyPaymentsInFlightException if the bulkhead is full and this would be a new
+     *     payment. Nothing is created either.
      */
     public CreatePaymentResult create(
             String merchantId,
@@ -59,9 +86,44 @@ public class IdempotentPaymentCreator {
             String paymentMethodToken,
             String externalReference,
             String idempotencyKey) {
+        // Fail fast, and before writing anything: a payment created now could only end FAILED, and
+        // its key would then replay that failure forever. A replay needs no processor, so a key
+        // that already exists goes on to be replayed as usual.
+        if (authorizer.processorIsRejectingCalls() && !keyAlreadyUsed(merchantId, idempotencyKey)) {
+            throw new ProcessorUnavailableException(authorizer.processorRetryAfter());
+        }
+        // The bulkhead: at most maxConcurrentCalls requests may be creating and authorising at
+        // once. Each holds a request thread for as long as the processor takes, so without a cap a
+        // slow processor takes every thread and requests that never call it - reads included -
+        // queue behind it. Refused without waiting, before anything is written, like the breaker.
+        boolean permitted = bulkhead.tryAcquirePermission();
+        if (!permitted && !keyAlreadyUsed(merchantId, idempotencyKey)) {
+            throw new TooManyPaymentsInFlightException(RETRY_WHEN_FULL);
+        }
         try {
-            return new CreatePaymentResult.Created(payments.create(
-                    merchantId, amount, paymentMethodToken, externalReference, idempotencyKey));
+            return createOrReplay(merchantId, amount, paymentMethodToken, externalReference, idempotencyKey);
+        } finally {
+            if (permitted) {
+                bulkhead.onComplete();
+            }
+        }
+    }
+
+    /** A replay needs no processor and no permit, so a used key is never refused. */
+    private boolean keyAlreadyUsed(String merchantId, String idempotencyKey) {
+        return idempotencyKey != null && payments.findIdempotencyKey(merchantId, idempotencyKey).isPresent();
+    }
+
+    private CreatePaymentResult createOrReplay(
+            String merchantId,
+            Money amount,
+            String paymentMethodToken,
+            String externalReference,
+            String idempotencyKey) {
+        Payment created;
+        try {
+            created = payments.create(
+                    merchantId, amount, paymentMethodToken, externalReference, idempotencyKey);
         } catch (DataIntegrityViolationException e) {
             // Only OUR constraint means "already used". Any other integrity failure is a real
             // error and must not be turned into a lookup.
@@ -87,8 +149,19 @@ public class IdempotentPaymentCreator {
                         idempotencyKey, original.id(),
                         differingFields(original, amount, externalReference));
             }
+            // The first call got a 504, so a retry gets the same. A 200 here would read as success.
+            if (Integer.valueOf(HttpStatus.GATEWAY_TIMEOUT.value()).equals(stored.getResponseStatus())) {
+                throw new PaymentOutcomeUnknownException(original.id(), true);
+            }
             return new CreatePaymentResult.Replayed(original);
         }
+        // Outside the try: a failure while authorising is not a duplicate key, whatever it is.
+        // And after create's transaction has committed, so the processor call holds no connection.
+        Payment authorized = authorizer.authorize(created.getId(), idempotencyKey);
+        if (authorized.getStatus() == PaymentStatus.PROCESSING) {
+            throw new PaymentOutcomeUnknownException(authorized.getId(), false);
+        }
+        return new CreatePaymentResult.Created(authorized);
     }
 
     /**
